@@ -61,17 +61,17 @@ def _nllb_translate(text: str, src_lang: str, tgt_lang: str) -> str:
 
 # ─────────────────────────────────────────────
 #  Speech-to-Text  (Whisper, offline)
+#  • "base"  – fast, good for English & Hindi
+#  • "small" – slower, much better for Kannada / Marathi / Bengali
 # ─────────────────────────────────────────────
-_whisper_model = None
+_whisper_models: dict = {}   # cache keyed by model size
 
-def _get_whisper():
-    global _whisper_model
-    if _whisper_model is None:
+def _get_whisper(size: str = "base"):
+    """Load and cache a Whisper model of the requested size."""
+    if size not in _whisper_models:
         import whisper
-        _whisper_model = whisper.load_model("base")
-    return _whisper_model
-
-
+        _whisper_models[size] = whisper.load_model(size)
+    return _whisper_models[size]
 
 
 # ─────────────────────────────────────────────
@@ -87,13 +87,17 @@ _GTTS_LANG = {
     "English":           "en",
 }
 
-# Whisper language hints for speech recognition
+# Whisper config per language:
+#   "lang"  – language code passed to Whisper
+#   "model" – which model size to use
+#   Kannada/Marathi/Bengali need the "small" model for reliable transcription;
+#   the "base" model has almost no training data for these scripts.
 _WHISPER_LANG = {
-    "Hindi (हिन्दी)":   "hi",
-    "Kannada (ಕನ್ನಡ)": "kn",
-    "Marathi (मराठी)":  "mr",
-    "Bengali (বাংলা)":  "bn",
-    "English":           "en",
+    "Hindi (हिन्दी)":   {"lang": "hi", "model": "base"},
+    "Kannada (ಕನ್ನಡ)": {"lang": "kn", "model": "small"},
+    "Marathi (मराठी)":  {"lang": "mr", "model": "small"},
+    "Bengali (বাংলা)":  {"lang": "bn", "model": "small"},
+    "English":           {"lang": "en", "model": "base"},
 }
 
 
@@ -452,9 +456,11 @@ class TranslatorApp(tk.Tk):
             self.status_var.set("🎤  Transcribing audio...")
 
             if self._direction == "en_to_native":
-                lang_hint = "en"
+                whisper_cfg = {"lang": "en", "model": "base"}
             else:
-                lang_hint = _WHISPER_LANG.get(self.lang_var.get(), "en")
+                whisper_cfg = _WHISPER_LANG.get(
+                    self.lang_var.get(), {"lang": "en", "model": "base"}
+                )
 
             def worker():
                 try:
@@ -462,23 +468,33 @@ class TranslatorApp(tk.Tk):
                     import scipy.io.wavfile as wav
                     import tempfile
                     import os
-                    
+
                     audio_data = []
                     while not self.audio_queue.empty():
                         audio_data.append(self.audio_queue.get())
-                        
+
                     if not audio_data:
                         self.after(0, self._on_mic_error, "No audio recorded.")
                         return
-                        
+
                     audio_np = np.concatenate(audio_data, axis=0)
-                    
+
                     tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
                     tmp.close()
                     wav.write(tmp.name, 16000, audio_np)
 
-                    model = _get_whisper()
-                    result = model.transcribe(tmp.name, language=lang_hint, fp16=False)
+                    model_size = whisper_cfg["model"]
+                    lang_code  = whisper_cfg["lang"]
+                    self.after(0, lambda s=model_size: self.status_var.set(
+                        f"🎤  Loading Whisper '{s}' model — please wait..."
+                    ))
+                    model = _get_whisper(model_size)
+                    result = model.transcribe(
+                        tmp.name,
+                        language=lang_code,
+                        task="transcribe",   # never translate to English
+                        fp16=False,
+                    )
                     
                     try:
                         os.unlink(tmp.name)
