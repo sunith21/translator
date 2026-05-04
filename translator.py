@@ -553,7 +553,7 @@ class TranslatorApp(tk.Tk):
                     except OSError:
                         pass
                         
-                    text = result["text"].strip()
+                    text = text.strip()
                     self.after(0, self._on_mic_done, text)
                 except Exception as exc:
                     self.after(0, self._on_mic_error, str(exc))
