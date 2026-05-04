@@ -6,6 +6,10 @@ import os
 from datetime import datetime
 import queue
 
+# Load .env for SARVAM_API_KEY
+from dotenv import load_dotenv
+load_dotenv()
+
 # ─────────────────────────────────────────────
 #  Lazy model cache  (loaded once per session)
 # ─────────────────────────────────────────────
@@ -60,11 +64,9 @@ def _nllb_translate(text: str, src_lang: str, tgt_lang: str) -> str:
 
 
 # ─────────────────────────────────────────────
-#  Speech-to-Text  (Whisper, offline)
-#  • "base"  – fast, good for English & Hindi
-#  • "small" – slower, much better for Kannada / Marathi / Bengali
+#  Speech-to-Text  (Whisper, offline — English only)
 # ─────────────────────────────────────────────
-_whisper_models: dict = {}   # cache keyed by model size
+_whisper_models: dict = {}  # cache keyed by model size
 
 def _get_whisper(size: str = "base"):
     """Load and cache a Whisper model of the requested size."""
@@ -72,6 +74,60 @@ def _get_whisper(size: str = "base"):
         import whisper
         _whisper_models[size] = whisper.load_model(size)
     return _whisper_models[size]
+
+
+# ─────────────────────────────────────────────
+#  Speech-to-Text  (Sarvam AI — Indian languages)
+#  API docs: https://docs.sarvam.ai/api-reference-docs/endpoints/speech-to-text
+#  Set SARVAM_API_KEY in your .env file.
+# ─────────────────────────────────────────────
+SARVAM_STT_URL = "https://api.sarvam.ai/speech-to-text"
+
+def sarvam_speech_to_text(wav_path: str, lang_code: str) -> str:
+    """Transcribe audio using Sarvam AI (best for Indian languages)."""
+    import requests
+
+    api_key = os.environ.get("SARVAM_API_KEY", "")
+    if not api_key:
+        raise RuntimeError(
+            "SARVAM_API_KEY not set.\n"
+            "Add it to your .env file:\n"
+            "  SARVAM_API_KEY=your_key_here"
+        )
+
+    with open(wav_path, "rb") as f:
+        response = requests.post(
+            SARVAM_STT_URL,
+            headers={"api-subscription-key": api_key},
+            files={"file": (os.path.basename(wav_path), f, "audio/wav")},
+            data={"model": "saaras:v2", "language_code": lang_code},
+            timeout=30,
+        )
+
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Sarvam API error {response.status_code}: {response.text}"
+        )
+
+    data = response.json()
+    transcript = data.get("transcript", "").strip()
+    if not transcript:
+        raise ValueError("Sarvam returned an empty transcript. Try speaking more clearly.")
+    return transcript
+
+
+# ─────────────────────────────────────────────
+#  STT routing table
+#    backend="sarvam"  → calls sarvam_speech_to_text()
+#    backend="whisper" → calls local Whisper model
+# ─────────────────────────────────────────────
+_STT_CONFIG = {
+    "Hindi (हिन्दी)":   {"backend": "sarvam", "lang": "hi-IN"},
+    "Kannada (ಕನ್ನಡ)": {"backend": "sarvam", "lang": "kn-IN"},
+    "Marathi (मराठी)":  {"backend": "sarvam", "lang": "mr-IN"},
+    "Bengali (বাংলা)":  {"backend": "sarvam", "lang": "bn-IN"},
+    "English":           {"backend": "whisper", "lang": "en", "model": "base"},
+}
 
 
 # ─────────────────────────────────────────────
@@ -85,19 +141,6 @@ _GTTS_LANG = {
     "Marathi (मराठी)":  "mr",
     "Bengali (বাংলা)":  "bn",
     "English":           "en",
-}
-
-# Whisper config per language:
-#   "lang"  – language code passed to Whisper
-#   "model" – which model size to use
-#   Kannada/Marathi/Bengali need the "small" model for reliable transcription;
-#   the "base" model has almost no training data for these scripts.
-_WHISPER_LANG = {
-    "Hindi (हिन्दी)":   {"lang": "hi", "model": "base"},
-    "Kannada (ಕನ್ನಡ)": {"lang": "kn", "model": "small"},
-    "Marathi (मराठी)":  {"lang": "mr", "model": "small"},
-    "Bengali (বাংলা)":  {"lang": "bn", "model": "small"},
-    "English":           {"lang": "en", "model": "base"},
 }
 
 
@@ -456,10 +499,10 @@ class TranslatorApp(tk.Tk):
             self.status_var.set("🎤  Transcribing audio...")
 
             if self._direction == "en_to_native":
-                whisper_cfg = {"lang": "en", "model": "base"}
+                stt_cfg = _STT_CONFIG.get("English")
             else:
-                whisper_cfg = _WHISPER_LANG.get(
-                    self.lang_var.get(), {"lang": "en", "model": "base"}
+                stt_cfg = _STT_CONFIG.get(
+                    self.lang_var.get(), _STT_CONFIG["English"]
                 )
 
             def worker():
@@ -483,18 +526,27 @@ class TranslatorApp(tk.Tk):
                     tmp.close()
                     wav.write(tmp.name, 16000, audio_np)
 
-                    model_size = whisper_cfg["model"]
-                    lang_code  = whisper_cfg["lang"]
-                    self.after(0, lambda s=model_size: self.status_var.set(
-                        f"🎤  Loading Whisper '{s}' model — please wait..."
-                    ))
-                    model = _get_whisper(model_size)
-                    result = model.transcribe(
-                        tmp.name,
-                        language=lang_code,
-                        task="transcribe",   # never translate to English
-                        fp16=False,
-                    )
+                    backend   = stt_cfg["backend"]
+                    lang_code = stt_cfg["lang"]
+
+                    if backend == "sarvam":
+                        self.after(0, lambda: self.status_var.set(
+                            "🎤  Sending to Sarvam AI — please wait..."
+                        ))
+                        text = sarvam_speech_to_text(tmp.name, lang_code)
+                    else:
+                        model_size = stt_cfg.get("model", "base")
+                        self.after(0, lambda s=model_size: self.status_var.set(
+                            f"🎤  Loading Whisper '{s}' model — please wait..."
+                        ))
+                        wmodel = _get_whisper(model_size)
+                        result = wmodel.transcribe(
+                            tmp.name,
+                            language=lang_code,
+                            task="transcribe",
+                            fp16=False,
+                        )
+                        text = result["text"]
                     
                     try:
                         os.unlink(tmp.name)
