@@ -100,7 +100,7 @@ def sarvam_speech_to_text(wav_path: str, lang_code: str) -> str:
             SARVAM_STT_URL,
             headers={"api-subscription-key": api_key},
             files={"file": (os.path.basename(wav_path), f, "audio/wav")},
-            data={"model": "saarika:v2", "language_code": lang_code},
+            data={"model": "saarika:v2.5", "language_code": lang_code},
             timeout=30,
         )
 
