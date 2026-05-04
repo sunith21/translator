@@ -1,0 +1,10 @@
+torch
+transformers
+sentencepiece
+openai-whisper
+sounddevice
+numpy
+scipy
+gtts
+pygame
+sacremoses
