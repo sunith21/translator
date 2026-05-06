@@ -13,3 +13,6 @@ python-dotenv
 customtkinter
 fpdf2
 pydub
+fastapi
+uvicorn
+python-multipart
