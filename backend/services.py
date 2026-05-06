@@ -152,7 +152,10 @@ class AIService:
         codes = {
             "Kannada (ಕನ್ನಡ)": "kan_Knda",
             "Marathi (मराठी)": "mar_Deva",
-            "Bengali (বাংলা)": "ben_Beng"
+            "Bengali (বাংলা)": "ben_Beng",
+            "Malayalam (മലയാളം)": "mal_Mlym",
+            "Tamil (தமிழ்)": "tam_Taml",
+            "Konkani (कोंकणी)": "mar_Deva"  # Fallback to Marathi as NLLB lacks Konkani
         }
         return codes.get(lang_key, "hin_Deva")
 

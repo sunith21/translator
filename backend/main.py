@@ -73,6 +73,8 @@ async def get_transcripts(patient_id: str):
 
 @app.post("/translate")
 async def translate(req: TranslationRequest):
+    if req.lang_key == "English":
+        return {"translated": req.text}
     result = ai.translate(req.text, req.direction, req.lang_key)
     return {"translated": result}
 
@@ -95,29 +97,43 @@ async def speech_to_text(
             "Kannada (ಕನ್ನಡ)": "kn-IN",
             "Marathi (मराठी)":  "mr-IN",
             "Bengali (বাংলা)":  "bn-IN",
+            "Malayalam (മലയാളം)": "ml-IN",
+            "Tamil (தமிழ்)": "ta-IN",
+            "Konkani (कोंकणी)": "gom-IN",
+            "English": "en-IN"
         }
         whisper_lang_codes = {
             "Hindi (हिन्दी)":   "hi",
             "Kannada (ಕನ್ನಡ)": "kn",
             "Marathi (मराठी)":  "mr",
             "Bengali (বাংলা)":  "bn",
+            "Malayalam (മലയാളം)": "ml",
+            "Tamil (தமிழ்)": "ta",
+            "Konkani (कोंकणी)": "gom",
+            "English": "en"
         }
 
         if role == "doctor":
             original = ai.whisper_stt(temp_path, "en")
             direction = "en_to_native"
         else:
-            # Try Sarvam AI first (best for Indian languages), fall back to Whisper
-            try:
-                original = ai.sarvam_stt(temp_path, sarvam_lang_codes.get(lang_key, "hi-IN"))
-            except Exception as sarvam_err:
-                print(f"[Sarvam STT failed, falling back to Whisper]: {sarvam_err}")
-                # Use correct Whisper language code so it doesn't misidentify the language
-                whisper_lang = whisper_lang_codes.get(lang_key, "hi")
-                original = ai.whisper_stt(temp_path, whisper_lang)
+            if lang_key == "English":
+                original = ai.whisper_stt(temp_path, "en")
+            else:
+                # Try Sarvam AI first (best for Indian languages), fall back to Whisper
+                try:
+                    original = ai.sarvam_stt(temp_path, sarvam_lang_codes.get(lang_key, "hi-IN"))
+                except Exception as sarvam_err:
+                    print(f"[Sarvam STT failed, falling back to Whisper]: {sarvam_err}")
+                    # Use correct Whisper language code so it doesn't misidentify the language
+                    whisper_lang = whisper_lang_codes.get(lang_key, "hi")
+                    original = ai.whisper_stt(temp_path, whisper_lang)
             direction = "native_to_en"
             
-        translated = ai.translate(original, direction, lang_key)
+        if lang_key == "English":
+            translated = original
+        else:
+            translated = ai.translate(original, direction, lang_key)
         
         return {
             "original": original,

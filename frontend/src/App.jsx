@@ -488,6 +488,10 @@ function Consultation({ patient, onEnd }) {
             <option>Kannada (ಕನ್ನಡ)</option>
             <option>Marathi (मराठी)</option>
             <option>Bengali (বাংলা)</option>
+            <option>Malayalam (മലയാളം)</option>
+            <option>Tamil (தமிழ்)</option>
+            <option>Konkani (कोंकणी)</option>
+            <option>English</option>
           </select>
         </div>
       </div>
