@@ -1,229 +1,21 @@
-import tkinter as tk
-import customtkinter as ctk
-from tkinter import ttk
-import threading
-import tempfile
-import os
-from datetime import datetime
-import queue
+import re
 
-# Load .env for SARVAM_API_KEY
-from dotenv import load_dotenv
-load_dotenv()
+with open('translator.py', 'r', encoding='utf-8') as f:
+    content = f.read()
 
-# ─────────────────────────────────────────────
-#  Lazy model cache  (loaded once per session)
-# ─────────────────────────────────────────────
-_model_cache: dict = {}
+# Add import
+if 'import customtkinter as ctk' not in content:
+    content = content.replace('import tkinter as tk', 'import tkinter as tk\nimport customtkinter as ctk')
 
-def _get_marian(model_name: str):
-    from transformers import MarianMTModel, MarianTokenizer
-    if model_name not in _model_cache:
-        _model_cache[model_name] = {
-            "tokenizer": MarianTokenizer.from_pretrained(model_name),
-            "model":     MarianMTModel.from_pretrained(model_name),
-        }
-    return _model_cache[model_name]["tokenizer"], _model_cache[model_name]["model"]
+# Update constants
+content = re.sub(
+    r'BG\s*=\s*"#1a1a2e"\s*\nCARD\s*=\s*"#16213e"\s*\nACCENT\s*=\s*"#e94560"\s*\nTEXT\s*=\s*"#eaeaea"\s*\nSUBTEXT\s*=\s*"#8899aa"\s*\nBTN_BG\s*=\s*"#0f3460"\s*\nFONT_H\s*=\s*\("Segoe UI", 13, "bold"\)\s*\nFONT_N\s*=\s*\("Segoe UI", 11\)\s*\nFONT_EN\s*=\s*\("Consolas", 11\)',
+    'ACCENT  = "#e94560"\nFONT_H  = ("Segoe UI", 14, "bold")\nFONT_N  = ("Segoe UI", 12)\nFONT_EN = ("Consolas", 12)',
+    content
+)
 
-
-def _get_nllb(model_name: str = "facebook/nllb-200-distilled-600M"):
-    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
-    if model_name not in _model_cache:
-        _model_cache[model_name] = {
-            "tokenizer": AutoTokenizer.from_pretrained(model_name, use_fast=False),
-            "model":     AutoModelForSeq2SeqLM.from_pretrained(model_name),
-        }
-    return _model_cache[model_name]["tokenizer"], _model_cache[model_name]["model"]
-
-
-# ─────────────────────────────────────────────
-#  Translation back-ends
-# ─────────────────────────────────────────────
-def translate_marian(text: str, model_name: str) -> str:
-    import torch
-    tokenizer, model = _get_marian(model_name)
-    inputs = tokenizer([text], return_tensors="pt", padding=True,
-                       truncation=True, max_length=512)
-    with torch.no_grad():
-        tokens = model.generate(**inputs, max_length=512,
-                                num_beams=5, early_stopping=True)
-    return tokenizer.decode(tokens[0], skip_special_tokens=True)
-
-
-def _nllb_translate(text: str, src_lang: str, tgt_lang: str) -> str:
-    import torch
-    tokenizer, model = _get_nllb()
-    tokenizer.src_lang = src_lang
-    inputs = tokenizer(text, return_tensors="pt",
-                       truncation=True, max_length=512)
-    bos_id = tokenizer.convert_tokens_to_ids(tgt_lang)
-    with torch.no_grad():
-        tokens = model.generate(**inputs, forced_bos_token_id=bos_id,
-                                max_length=512, num_beams=4, early_stopping=True)
-    return tokenizer.decode(tokens[0], skip_special_tokens=True)
-
-
-
-# ─────────────────────────────────────────────
-#  Speech-to-Text  (Whisper, offline — English only)
-# ─────────────────────────────────────────────
-_whisper_models: dict = {}  # cache keyed by model size
-
-def _get_whisper(size: str = "base"):
-    """Load and cache a Whisper model of the requested size."""
-    if size not in _whisper_models:
-        import whisper
-        _whisper_models[size] = whisper.load_model(size)
-    return _whisper_models[size]
-
-
-# ─────────────────────────────────────────────
-#  Speech-to-Text  (Sarvam AI — Indian languages)
-#  API docs: https://docs.sarvam.ai/api-reference-docs/endpoints/speech-to-text
-#  Set SARVAM_API_KEY in your .env file.
-# ─────────────────────────────────────────────
-SARVAM_STT_URL = "https://api.sarvam.ai/speech-to-text"
-
-def sarvam_speech_to_text(wav_path: str, lang_code: str) -> str:
-    """Transcribe audio using Sarvam AI (best for Indian languages)."""
-    import requests
-
-    api_key = os.environ.get("SARVAM_API_KEY", "")
-    if not api_key:
-        raise RuntimeError(
-            "SARVAM_API_KEY not set.\n"
-            "Add it to your .env file:\n"
-            "  SARVAM_API_KEY=your_key_here"
-        )
-
-    with open(wav_path, "rb") as f:
-        response = requests.post(
-            SARVAM_STT_URL,
-            headers={"api-subscription-key": api_key},
-            files={"file": (os.path.basename(wav_path), f, "audio/wav")},
-            data={"model": "saarika:v2.5", "language_code": lang_code},
-            timeout=30,
-        )
-
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"Sarvam API error {response.status_code}: {response.text}"
-        )
-
-    data = response.json()
-    transcript = data.get("transcript", "").strip()
-    if not transcript:
-        raise ValueError("Sarvam returned an empty transcript. Try speaking more clearly.")
-    return transcript
-
-
-# ─────────────────────────────────────────────
-#  STT routing table
-#    backend="sarvam"  → calls sarvam_speech_to_text()
-#    backend="whisper" → calls local Whisper model
-# ─────────────────────────────────────────────
-_STT_CONFIG = {
-    "Hindi (हिन्दी)":   {"backend": "sarvam", "lang": "hi-IN"},
-    "Kannada (ಕನ್ನಡ)": {"backend": "sarvam", "lang": "kn-IN"},
-    "Marathi (मराठी)":  {"backend": "sarvam", "lang": "mr-IN"},
-    "Bengali (বাংলা)":  {"backend": "sarvam", "lang": "bn-IN"},
-    "English":           {"backend": "whisper", "lang": "en", "model": "base"},
-}
-
-
-# ─────────────────────────────────────────────
-#  Text-to-Speech  (gTTS, needs internet)
-# ─────────────────────────────────────────────
-
-# Map our language keys to BCP-47 codes for gTTS
-_GTTS_LANG = {
-    "Hindi (हिन्दी)":   "hi",
-    "Kannada (ಕನ್ನಡ)": "kn",
-    "Marathi (मराठी)":  "mr",
-    "Bengali (বাংলা)":  "bn",
-    "English":           "en",
-}
-
-
-def speak_text(text: str, lang_key: str):
-    """Convert text to speech and play it via gTTS."""
-    from gtts import gTTS
-    import pygame
-
-    code = _GTTS_LANG.get(lang_key, "en")
-    tts  = gTTS(text=text, lang=code, slow=False)
-
-    tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
-    tmp.close()
-    tts.save(tmp.name)
-
-    pygame.mixer.init()
-    pygame.mixer.music.load(tmp.name)
-    pygame.mixer.music.play()
-    while pygame.mixer.music.get_busy():
-        pygame.time.wait(100)
-    
-    try:
-        pygame.mixer.music.unload()
-    except AttributeError:
-        pass  # In case of older pygame version
-    pygame.mixer.quit()
-    
-    try:
-        os.unlink(tmp.name)
-    except OSError:
-        pass
-
-
-#  Each entry has:
-#    "native"     – display name with script
-#    "en_to"      – fn to translate English → this language
-#    "to_en"      – fn to translate this language → English
-#    "font_native"– font for rendering native script
-# ─────────────────────────────────────────────
-LANGUAGES = {
-    "Hindi (हिन्दी)": {
-        "native":      "Hindi (हिन्दी)",
-        "en_to":       lambda t: translate_marian(t, "Helsinki-NLP/opus-mt-en-hi"),
-        "to_en":       lambda t: translate_marian(t, "Helsinki-NLP/opus-mt-hi-en"),
-        "font_native": ("Nirmala UI", 14),
-    },
-    "Kannada (ಕನ್ನಡ)": {
-        "native":      "Kannada (ಕನ್ನಡ)",
-        "en_to":       lambda t: _nllb_translate(t, "eng_Latn", "kan_Knda"),
-        "to_en":       lambda t: _nllb_translate(t, "kan_Knda", "eng_Latn"),
-        "font_native": ("Noto Sans Kannada", 14),
-    },
-    "Marathi (मराठी)": {
-        "native":      "Marathi (मराठी)",
-        "en_to":       lambda t: _nllb_translate(t, "eng_Latn", "mar_Deva"),
-        "to_en":       lambda t: _nllb_translate(t, "mar_Deva", "eng_Latn"),
-        "font_native": ("Nirmala UI", 14),
-    },
-    "Bengali (বাংলা)": {
-        "native":      "Bengali (বাংলা)",
-        "en_to":       lambda t: _nllb_translate(t, "eng_Latn", "ben_Beng"),
-        "to_en":       lambda t: _nllb_translate(t, "ben_Beng", "eng_Latn"),
-        "font_native": ("Noto Sans Bengali", 14),
-    },
-}
-
-MAX_CHARS  = 1000
-HIST_LIMIT = 20
-
-# ─────────────────────────────────────────────
-#  Color / font constants
-# ─────────────────────────────────────────────
-ACCENT  = "#e94560"
-FONT_H  = ("Segoe UI", 14, "bold")
-FONT_N  = ("Segoe UI", 12)
-FONT_EN = ("Consolas", 12)
-
-
-# ─────────────────────────────────────────────
-#  App
-# ─────────────────────────────────────────────
-class TranslatorApp(ctk.CTk):
+# New App Class
+new_app_class = """class TranslatorApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         ctk.set_appearance_mode("Dark")
@@ -591,11 +383,17 @@ class TranslatorApp(ctk.CTk):
 
         for item in self.history:
             lb.insert(tk.END,
-                      f"[{item['ts']}]  {item['arrow']}\n"
-                      f"  IN:  {item['src']}\n"
-                      f"  OUT: {item['tgt']}\n\n")
-        lb.configure(state="disabled")
+                      f"[{item['ts']}]  {item['arrow']}\\n"
+                      f"  IN:  {item['src']}\\n"
+                      f"  OUT: {item['tgt']}\\n\\n")
+        lb.configure(state="disabled")"""
 
-if __name__ == "__main__":
-    app = TranslatorApp()
-    app.mainloop()
+# Find the start of class TranslatorApp
+start_idx = content.find('class TranslatorApp(tk.Tk):')
+end_idx = content.find('if __name__ == "__main__":')
+
+if start_idx != -1 and end_idx != -1:
+    content = content[:start_idx] + new_app_class + "\n\n" + content[end_idx:]
+
+with open('translator.py', 'w', encoding='utf-8') as f:
+    f.write(content)

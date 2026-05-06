@@ -10,3 +10,4 @@ pygame
 sacremoses
 requests
 python-dotenv
+customtkinter
