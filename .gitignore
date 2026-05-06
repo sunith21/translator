@@ -1,3 +1,4 @@
+# Python
 .venv/
 venv/
 __pycache__/
@@ -7,5 +8,20 @@ __pycache__/
 .Python
 *.log
 *.DS_Store
+
+# Data / DB
 patients/
+data/
 hospital_data.db
+*.db
+
+# Models / fonts downloaded at runtime
+DejaVuSans*.ttf
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Env
+.env
