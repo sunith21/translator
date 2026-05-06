@@ -11,3 +11,5 @@ sacremoses
 requests
 python-dotenv
 customtkinter
+fpdf2
+pydub
