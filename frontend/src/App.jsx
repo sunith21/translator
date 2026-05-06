@@ -104,7 +104,7 @@ function App() {
         {view === 'dashboard' && <Dashboard onOpenPatient={(p) => navigateTo('consultation', p)} />}
         {view === 'new-patient' && <NewPatient onStart={(p) => navigateTo('consultation', p)} />}
         {view === 'search' && <SearchPatient onOpenPatient={(p) => navigateTo('consultation', p)} />}
-        {view === 'consultation' && <Consultation patient={currentPatient} onEnd={() => navigateTo('dashboard')} />}
+        {view === 'consultation' && <Consultation key={currentPatient.id} patient={currentPatient} onEnd={() => navigateTo('dashboard')} />}
       </main>
     </div>
   );
