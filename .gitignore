@@ -7,3 +7,5 @@ __pycache__/
 .Python
 *.log
 *.DS_Store
+patients/
+hospital_data.db
