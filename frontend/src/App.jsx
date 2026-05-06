@@ -277,21 +277,29 @@ function Consultation({ patient, onEnd }) {
   const [vadState, setVadState]   = useState('idle'); // idle | listening | speaking | processing
   const [audioLevel, setAudioLevel] = useState(0);
   const [queueLen, setQueueLen]   = useState(0);
+  const [vadThreshold, setVadThreshold] = useState(0.025);
 
   // Refs
   const mediaRecorder   = useRef(null);
   const audioChunks     = useRef([]);
-  const langKeyRef      = useRef(langKey);
   const chatEndRef      = useRef(null);
-  const liveRoleRef     = useRef(liveRole);
-  const liveCtxRef      = useRef(null);
-  const liveProcessorRef= useRef(null);
-  const liveStreamRef   = useRef(null);
-  const vadQueue        = useRef([]);
-  const vadProcessing   = useRef(false);
-
+  
+  // Live VAD refs
+  const liveCtxRef = useRef(null);
+  const liveProcessorRef = useRef(null);
+  const liveStreamRef = useRef(null);
+  const vadQueue = useRef([]);
+  const vadProcessing = useRef(false);
+  
+  // Ensure the audio processor uses the latest role, language, and threshold
+  const currentRoleRef = useRef(currentRole);
+  const langKeyRef = useRef(langKey);
+  const liveRoleRef = useRef(liveRole);
+  const vadThresholdRef = useRef(vadThreshold);
+  useEffect(() => { currentRoleRef.current = currentRole; }, [currentRole]);
   useEffect(() => { langKeyRef.current = langKey; }, [langKey]);
   useEffect(() => { liveRoleRef.current = liveRole; }, [liveRole]);
+  useEffect(() => { vadThresholdRef.current = vadThreshold; }, [vadThreshold]);
 
   useEffect(() => {
     axios.get(`${API_BASE}/patients/${patient.id}/transcripts`)
@@ -347,7 +355,6 @@ function Consultation({ patient, onEnd }) {
       const proc = ctx.createScriptProcessor(4096, 1, 1);
       liveProcessorRef.current = proc;
 
-      const THRESH     = 0.012;   // RMS speech threshold
       const SILENCE_MS = 1500;    // silence duration before segment commit
       const MIN_MS     = 350;     // minimum speech duration
 
@@ -365,12 +372,13 @@ function Consultation({ patient, onEnd }) {
         const now = Date.now();
 
         // Throttle level updates to ~10 fps
+        const currentThresh = vadThresholdRef.current;
         if (now - levelThrottle > 100) {
-          setAudioLevel(Math.min(1, rms / THRESH));
+          setAudioLevel(Math.min(1, rms / currentThresh));
           levelThrottle = now;
         }
 
-        if (rms > THRESH) {
+        if (rms > currentThresh) {
           if (!speaking) {
             speaking = true; silenceStart = null;
             speechBuf = []; speechStartMs = now;
@@ -626,6 +634,27 @@ function Consultation({ patient, onEnd }) {
         <div className="session-sidebar">
           <div className="card sidebar-card">
             <h4>Session Tools</h4>
+            
+            <div className="form-group" style={{ marginBottom: '15px' }}>
+              <label style={{ fontSize: '12px', display: 'flex', justifyContent: 'space-between' }}>
+                <span>Noise Filter:</span>
+                <span>{Math.round(vadThreshold * 1000)}</span>
+              </label>
+              <input 
+                type="range" 
+                min="0.005" 
+                max="0.08" 
+                step="0.001" 
+                value={vadThreshold} 
+                onChange={(e) => setVadThreshold(parseFloat(e.target.value))}
+                title="Increase to ignore background noise (fans, hums). Decrease to pick up quiet voices."
+                style={{ width: '100%', cursor: 'pointer' }}
+              />
+              <span style={{ fontSize: '11px', color: '#64748b' }}>
+                Higher = Ignores more background noise
+              </span>
+            </div>
+
             <button className="btn-outline" onClick={downloadPDF}>
               <FileText size={16} /> Download PDF Report
             </button>

@@ -217,12 +217,19 @@ class AIService:
 class ReportGenerator:
     @staticmethod
     def _safe_multi_cell(pdf, text):
-        # Pre-check encoding so we don't corrupt FPDF's internal state
+        # Manually sanitize to latin-1 to avoid FPDF internal encoding crashes
+        safe_text = text.encode('latin-1', 'replace').decode('latin-1')
+        
+        # FPDF crashes with "Not enough horizontal space" if a single word (no spaces) 
+        # is wider than the page. We force a space every 60 characters to prevent this.
+        import re
+        safe_text = re.sub(r'(\S{60})', r'\1 ', safe_text)
+        
         try:
-            text.encode('latin-1')
-            pdf.multi_cell(0, 5, text)
-        except Exception:
-            pdf.multi_cell(0, 5, "[Text contains unsupported characters]")
+            pdf.multi_cell(0, 5, safe_text)
+        except Exception as e:
+            # If it still fails, do not call multi_cell again as FPDF state is corrupted.
+            print(f"FPDF multi_cell ignored due to error: {e}")
 
     @staticmethod
     def generate_pdf(patient_id, patient_name):
