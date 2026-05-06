@@ -239,8 +239,20 @@ class ReportGenerator:
             pdf.set_font("Arial", "B", 10)
             pdf.cell(0, 5, f"[{entry['timestamp']}] {entry['role'].upper()}:", ln=True)
             pdf.set_font("Arial", "", 10)
-            pdf.multi_cell(0, 5, f"Original: {entry['original']}")
-            pdf.multi_cell(0, 5, f"Translated: {entry['translated']}")
+            
+            original_text = f"Original: {entry['original']}"
+            translated_text = f"Translated: {entry['translated']}"
+            
+            try:
+                pdf.multi_cell(0, 5, original_text)
+            except Exception:
+                pdf.multi_cell(0, 5, original_text.encode('latin-1', 'replace').decode('latin-1'))
+                
+            try:
+                pdf.multi_cell(0, 5, translated_text)
+            except Exception:
+                pdf.multi_cell(0, 5, translated_text.encode('latin-1', 'replace').decode('latin-1'))
+                
             pdf.ln(3)
 
         pdf.output(str(pdf_path))
@@ -279,9 +291,22 @@ class ReportGenerator:
             pdf.set_font("Arial", "B", 10)
             pdf.cell(0, 5, f"[{entry['timestamp']}] {entry['role'].upper()}:", ln=True)
             pdf.set_font("Arial", "", 10)
-            # Replace problematic characters if necessary, though FPDF Arial handles basic latin
-            pdf.multi_cell(0, 5, f"Original: {entry['original']}")
-            pdf.multi_cell(0, 5, f"Translated: {entry['translated']}")
+            
+            # FPDF standard fonts do not support complex Unicode (like Hindi/Kannada)
+            # If it throws an error, fallback to replacing unencodable chars with '?'
+            original_text = f"Original: {entry['original']}"
+            translated_text = f"Translated: {entry['translated']}"
+            
+            try:
+                pdf.multi_cell(0, 5, original_text)
+            except Exception:
+                pdf.multi_cell(0, 5, original_text.encode('latin-1', 'replace').decode('latin-1'))
+                
+            try:
+                pdf.multi_cell(0, 5, translated_text)
+            except Exception:
+                pdf.multi_cell(0, 5, translated_text.encode('latin-1', 'replace').decode('latin-1'))
+                
             pdf.ln(3)
 
         pdf.output(str(pdf_path))
