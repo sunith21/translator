@@ -246,12 +246,18 @@ class ReportGenerator:
             try:
                 pdf.multi_cell(0, 5, original_text)
             except Exception:
-                pdf.multi_cell(0, 5, original_text.encode('latin-1', 'replace').decode('latin-1'))
+                try:
+                    pdf.multi_cell(0, 5, original_text.encode('latin-1', 'replace').decode('latin-1'))
+                except Exception:
+                    pdf.multi_cell(0, 5, "[Original Text contains unsupported characters]")
                 
             try:
                 pdf.multi_cell(0, 5, translated_text)
             except Exception:
-                pdf.multi_cell(0, 5, translated_text.encode('latin-1', 'replace').decode('latin-1'))
+                try:
+                    pdf.multi_cell(0, 5, translated_text.encode('latin-1', 'replace').decode('latin-1'))
+                except Exception:
+                    pdf.multi_cell(0, 5, "[Translated Text contains unsupported characters]")
                 
             pdf.ln(3)
 
@@ -300,12 +306,18 @@ class ReportGenerator:
             try:
                 pdf.multi_cell(0, 5, original_text)
             except Exception:
-                pdf.multi_cell(0, 5, original_text.encode('latin-1', 'replace').decode('latin-1'))
+                try:
+                    pdf.multi_cell(0, 5, original_text.encode('latin-1', 'replace').decode('latin-1'))
+                except Exception:
+                    pdf.multi_cell(0, 5, "[Original Text contains unsupported characters]")
                 
             try:
                 pdf.multi_cell(0, 5, translated_text)
             except Exception:
-                pdf.multi_cell(0, 5, translated_text.encode('latin-1', 'replace').decode('latin-1'))
+                try:
+                    pdf.multi_cell(0, 5, translated_text.encode('latin-1', 'replace').decode('latin-1'))
+                except Exception:
+                    pdf.multi_cell(0, 5, "[Translated Text contains unsupported characters]")
                 
             pdf.ln(3)
 
