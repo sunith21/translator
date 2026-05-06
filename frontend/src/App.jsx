@@ -320,6 +320,7 @@ function Consultation({ patient, onEnd }) {
       fd.append('file', wav, 'recording.wav');
       fd.append('role', role);
       fd.append('lang_key', lk);
+      fd.append('patient_id', pid);
       const res   = await axios.post(`${API_BASE}/stt`, fd);
       const entry = { role, original: res.data.original, translated: res.data.translated };
       await axios.post(`${API_BASE}/patients/${pid}/append_transcript`, entry);
@@ -433,6 +434,7 @@ function Consultation({ patient, onEnd }) {
           fd.append('file', wav, 'recording.wav');
           fd.append('role', role);
           fd.append('lang_key', langKeyRef.current);
+          fd.append('patient_id', patient.id);
           setStatus('Transcribing & translating…');
           const res   = await axios.post(`${API_BASE}/stt`, fd);
           const entry = { role, original: res.data.original, translated: res.data.translated };
@@ -468,6 +470,22 @@ function Consultation({ patient, onEnd }) {
   };
 
   const downloadPDF = () => window.open(`${API_BASE}/patients/${patient.id}/pdf`, '_blank');
+  
+  const clearChat = async () => {
+    if (!window.confirm("Are you sure you want to clear this chat? It will be archived securely as a PDF.")) return;
+    setIsProcessing(true);
+    setStatus('Archiving chat…');
+    try {
+      await axios.post(`${API_BASE}/patients/${patient.id}/clear_chat`);
+      setMessages([]);
+      setStatus('Chat cleared and archived ✓');
+    } catch (err) {
+      setStatus(`Error clearing chat: ${err.response?.data?.detail || err.message}`);
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
   const busy = isRecording || isProcessing;
   const anyBusy = busy || isTranslatingText;
 
@@ -610,6 +628,9 @@ function Consultation({ patient, onEnd }) {
             <h4>Session Tools</h4>
             <button className="btn-outline" onClick={downloadPDF}>
               <FileText size={16} /> Download PDF Report
+            </button>
+            <button className="btn-outline" onClick={clearChat} disabled={anyBusy} style={{ borderColor: '#f59e0b', color: '#f59e0b' }}>
+              <Square size={16} /> Clear Chat & Archive
             </button>
             <button className="btn-danger" onClick={onEnd} disabled={anyBusy}>
               <LogOut size={16} /> End Session

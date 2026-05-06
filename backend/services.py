@@ -245,3 +245,49 @@ class ReportGenerator:
 
         pdf.output(str(pdf_path))
         return pdf_path
+
+    @staticmethod
+    def archive_chat(patient_id, patient_name):
+        from datetime import datetime
+        p_dir = PATIENTS_DIR / patient_id
+        log_path = p_dir / "transcripts.json"
+        
+        if not log_path.exists():
+            return None
+            
+        with open(log_path, "r", encoding="utf-8") as f:
+            transcripts = json.load(f)
+            
+        if not transcripts:
+            return None
+            
+        history_dir = p_dir / "history"
+        history_dir.mkdir(exist_ok=True)
+        
+        timestamp = int(datetime.now().timestamp())
+        pdf_path = history_dir / f"chat_history_{timestamp}.pdf"
+        
+        pdf = FPDF()
+        pdf.add_page()
+        pdf.set_font("Arial", "B", 16)
+        pdf.cell(0, 10, f"Medical Consultation Archive - {patient_name}", ln=True, align="C")
+        pdf.set_font("Arial", "", 10)
+        pdf.cell(0, 8, f"Patient ID: {patient_id} | Archived: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", ln=True, align="C")
+        pdf.ln(6)
+
+        for entry in transcripts:
+            pdf.set_font("Arial", "B", 10)
+            pdf.cell(0, 5, f"[{entry['timestamp']}] {entry['role'].upper()}:", ln=True)
+            pdf.set_font("Arial", "", 10)
+            # Replace problematic characters if necessary, though FPDF Arial handles basic latin
+            pdf.multi_cell(0, 5, f"Original: {entry['original']}")
+            pdf.multi_cell(0, 5, f"Translated: {entry['translated']}")
+            pdf.ln(3)
+
+        pdf.output(str(pdf_path))
+        
+        # Clear transcripts
+        with open(log_path, "w", encoding="utf-8") as f:
+            json.dump([], f, ensure_ascii=False, indent=2)
+            
+        return pdf_path

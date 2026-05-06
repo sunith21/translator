@@ -71,6 +71,24 @@ async def get_transcripts(patient_id: str):
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
+@app.post("/patients/{patient_id}/clear_chat")
+async def clear_chat(patient_id: str):
+    patient = pm.get_patient(patient_id)
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found")
+        
+    pdf_path = ReportGenerator.archive_chat(patient_id, patient["name"])
+    if not pdf_path:
+        # No chat to archive, just clear if needed
+        path = os.path.join("data", "patients", patient_id, "transcripts.json")
+        if os.path.exists(path):
+            import json
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump([], f)
+        return {"status": "cleared"}
+        
+    return {"status": "archived"}
+
 @app.post("/translate")
 async def translate(req: TranslationRequest):
     if req.lang_key == "English":
@@ -82,10 +100,15 @@ async def translate(req: TranslationRequest):
 async def speech_to_text(
     file: UploadFile = File(...),
     role: str = Form(...),
-    lang_key: str = Form(...)
+    lang_key: str = Form(...),
+    patient_id: str = Form(...)
 ):
-    temp_dir = tempfile.gettempdir()
-    temp_path = os.path.join(temp_dir, f"upload_{role}.wav")
+    # Ensure patient recordings directory exists
+    recordings_dir = os.path.join("data", "patients", patient_id, "recordings")
+    os.makedirs(recordings_dir, exist_ok=True)
+    
+    timestamp = int(datetime.now().timestamp())
+    temp_path = os.path.join(recordings_dir, f"upload_{role}_{timestamp}.wav")
     
     with open(temp_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
