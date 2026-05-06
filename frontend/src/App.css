@@ -402,3 +402,73 @@ body {
 .session-sidebar { display: flex; flex-direction: column; }
 .sidebar-card { display: flex; flex-direction: column; gap: 0.75rem; height: 100%; }
 .sidebar-card h4 { margin: 0 0 0.25rem; font-size: 0.875rem; font-weight: 600; color: var(--subtext); text-transform: uppercase; letter-spacing: 0.06em; }
+
+/* ── Patient text input panel ── */
+.patient-text-panel {
+  border-top: 1px solid var(--card-border);
+  padding: 0.75rem 1.25rem;
+  background: rgba(78, 204, 163, 0.04);
+}
+
+.patient-text-header {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--success);
+  margin-bottom: 0.5rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.lang-badge {
+  margin-left: auto;
+  background: rgba(78, 204, 163, 0.15);
+  color: var(--success);
+  border-radius: 4px;
+  padding: 0.1rem 0.45rem;
+  font-size: 0.7rem;
+}
+
+.patient-text-row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: flex-end;
+}
+
+.patient-textarea {
+  flex: 1;
+  padding: 0.6rem 0.75rem;
+  background: var(--surface);
+  border: 1px solid rgba(78, 204, 163, 0.25);
+  border-radius: 8px;
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 0.9rem;
+  resize: none;
+  outline: none;
+  transition: border-color 0.15s;
+  line-height: 1.4;
+}
+.patient-textarea:focus { border-color: var(--success); }
+.patient-textarea:disabled { opacity: 0.5; }
+
+.btn-send {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  flex-shrink: 0;
+  background: var(--success);
+  color: #000;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: opacity 0.15s, transform 0.1s;
+}
+.btn-send:hover:not(:disabled) { opacity: 0.85; }
+.btn-send:active:not(:disabled) { transform: scale(0.95); }
+.btn-send:disabled { opacity: 0.3; cursor: not-allowed; }
+

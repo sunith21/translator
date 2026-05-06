@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import axios from 'axios';
-import { LayoutDashboard, UserPlus, Search, Mic, Square, FileText, History, LogOut, Activity, Clock, User } from 'lucide-react';
+import { LayoutDashboard, UserPlus, Search, Mic, Square, FileText, LogOut, Activity, Clock, User, Send, Keyboard } from 'lucide-react';
 import './App.css';
 
 const API_BASE = 'http://localhost:8000';
@@ -250,6 +250,8 @@ function Consultation({ patient, onEnd }) {
   const [currentRole, setCurrentRole] = useState(null);
   const [langKey, setLangKey] = useState('Hindi (हिन्दी)');
   const [status, setStatus] = useState('Ready');
+  const [patientText, setPatientText] = useState('');
+  const [isTranslatingText, setIsTranslatingText] = useState(false);
   const mediaRecorder = useRef(null);
   const audioChunks = useRef([]);
   const langKeyRef = useRef(langKey);
@@ -335,6 +337,28 @@ function Consultation({ patient, onEnd }) {
     window.open(`${API_BASE}/patients/${patient.id}/pdf`, '_blank');
   };
 
+  const submitPatientText = async () => {
+    if (!patientText.trim()) return;
+    setIsTranslatingText(true);
+    setStatus('Translating patient text…');
+    try {
+      const res = await axios.post(`${API_BASE}/translate`, {
+        text: patientText,
+        direction: 'native_to_en',
+        lang_key: langKey,
+      });
+      const entry = { role: 'patient', original: patientText, translated: res.data.translated };
+      await axios.post(`${API_BASE}/patients/${patient.id}/append_transcript`, entry);
+      setMessages(prev => [...prev, { ...entry, timestamp: new Date().toLocaleTimeString() }]);
+      setPatientText('');
+      setStatus('Done ✓');
+    } catch (err) {
+      setStatus(`Text translate error: ${err.response?.data?.detail || err.message}`);
+    } finally {
+      setIsTranslatingText(false);
+    }
+  };
+
   const busy = isRecording || isProcessing;
 
   return (
@@ -382,9 +406,36 @@ function Consultation({ patient, onEnd }) {
           </div>
 
           {/* Status bar */}
-          <div className={`status-bar ${isProcessing ? 'processing' : ''}`}>
-            {isProcessing && <span className="spinner" />}
+          <div className={`status-bar ${(isProcessing || isTranslatingText) ? 'processing' : ''}`}>
+            {(isProcessing || isTranslatingText) && <span className="spinner" />}
             {status}
+          </div>
+
+          {/* Patient text input */}
+          <div className="patient-text-panel">
+            <div className="patient-text-header">
+              <Keyboard size={15} />
+              <span>Patient — Type Message</span>
+              <span className="lang-badge">{langKey.split(' ')[0]}</span>
+            </div>
+            <div className="patient-text-row">
+              <textarea
+                className="patient-textarea"
+                placeholder={`Type patient's message in ${langKey.split('(')[0].trim()}…`}
+                value={patientText}
+                onChange={e => setPatientText(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submitPatientText(); } }}
+                disabled={busy || isTranslatingText}
+                rows={2}
+              />
+              <button
+                className="btn-send"
+                onClick={submitPatientText}
+                disabled={!patientText.trim() || busy || isTranslatingText}
+              >
+                <Send size={16} />
+              </button>
+            </div>
           </div>
 
           {/* Recording controls */}
@@ -392,18 +443,18 @@ function Consultation({ patient, onEnd }) {
             <button
               className={`btn-record ${currentRole === 'doctor' && isRecording ? 'recording' : ''}`}
               onClick={isRecording ? stopRecording : () => startRecording('doctor')}
-              disabled={busy && currentRole !== 'doctor'}
+              disabled={(busy || isTranslatingText) && currentRole !== 'doctor'}
             >
-              {currentRole === 'doctor' && isRecording ? <Square size={20} /> : <Mic size={20} />}
-              {currentRole === 'doctor' && isRecording ? '■ Stop Doctor' : '🎤 Doctor Speak'}
+              {currentRole === 'doctor' && isRecording ? <Square size={18} /> : <Mic size={18} />}
+              {currentRole === 'doctor' && isRecording ? '■ Stop' : '🎤 Doctor Speak'}
             </button>
             <button
               className={`btn-record ${currentRole === 'patient' && isRecording ? 'recording' : ''}`}
               onClick={isRecording ? stopRecording : () => startRecording('patient')}
-              disabled={busy && currentRole !== 'patient'}
+              disabled={(busy || isTranslatingText) && currentRole !== 'patient'}
             >
-              {currentRole === 'patient' && isRecording ? <Square size={20} /> : <Mic size={20} />}
-              {currentRole === 'patient' && isRecording ? '■ Stop Patient' : '🎤 Patient Speak'}
+              {currentRole === 'patient' && isRecording ? <Square size={18} /> : <Mic size={18} />}
+              {currentRole === 'patient' && isRecording ? '■ Stop' : '🎤 Patient Speak'}
             </button>
           </div>
         </div>

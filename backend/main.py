@@ -7,7 +7,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from datetime import datetime
+from dotenv import load_dotenv
 from backend.services import PatientManager, AIService, ReportGenerator
+
+# Load .env so SARVAM_API_KEY is available
+load_dotenv()
+
 
 app = FastAPI()
 
@@ -84,18 +89,32 @@ async def speech_to_text(
         shutil.copyfileobj(file.file, buffer)
     
     try:
-        lang_codes = {
-            "Hindi (हिन्दी)": "hi-IN",
+        # Sarvam uses BCP-47 codes (hi-IN), Whisper uses ISO 639-1 (hi)
+        sarvam_lang_codes = {
+            "Hindi (हिन्दी)":   "hi-IN",
             "Kannada (ಕನ್ನಡ)": "kn-IN",
-            "Marathi (मराठी)": "mr-IN",
-            "Bengali (বাংলা)": "bn-IN"
+            "Marathi (मराठी)":  "mr-IN",
+            "Bengali (বাংলা)":  "bn-IN",
         }
-        
+        whisper_lang_codes = {
+            "Hindi (हिन्दी)":   "hi",
+            "Kannada (ಕನ್ನಡ)": "kn",
+            "Marathi (मराठी)":  "mr",
+            "Bengali (বাংলা)":  "bn",
+        }
+
         if role == "doctor":
             original = ai.whisper_stt(temp_path, "en")
             direction = "en_to_native"
         else:
-            original = ai.sarvam_stt(temp_path, lang_codes.get(lang_key, "hi-IN"))
+            # Try Sarvam AI first (best for Indian languages), fall back to Whisper
+            try:
+                original = ai.sarvam_stt(temp_path, sarvam_lang_codes.get(lang_key, "hi-IN"))
+            except Exception as sarvam_err:
+                print(f"[Sarvam STT failed, falling back to Whisper]: {sarvam_err}")
+                # Use correct Whisper language code so it doesn't misidentify the language
+                whisper_lang = whisper_lang_codes.get(lang_key, "hi")
+                original = ai.whisper_stt(temp_path, whisper_lang)
             direction = "native_to_en"
             
         translated = ai.translate(original, direction, lang_key)

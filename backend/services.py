@@ -170,8 +170,9 @@ class AIService:
         return response.json().get("transcript", "").strip()
 
     @staticmethod
-    def whisper_stt(wav_path, lang_code="en"):
-        """Transcribe using Whisper with scipy audio loading — no ffmpeg required."""
+    def whisper_stt(wav_path, lang_code=None):
+        """Transcribe using Whisper with scipy audio loading — no ffmpeg required.
+        lang_code=None means Whisper auto-detects the language."""
         import numpy as np
         import scipy.io.wavfile as wavfile
 
@@ -200,7 +201,11 @@ class AIService:
             num_samples = int(len(audio) * 16000 / sample_rate)
             audio = signal.resample(audio, num_samples)
 
-        res = wmodel.transcribe(audio, language=lang_code, fp16=False)
+        kwargs = {"fp16": False}
+        if lang_code:
+            kwargs["language"] = lang_code
+
+        res = wmodel.transcribe(audio, **kwargs)
         return res["text"].strip()
 
 # ─────────────────────────────────────────────
