@@ -216,6 +216,15 @@ class AIService:
 # ─────────────────────────────────────────────
 class ReportGenerator:
     @staticmethod
+    def _safe_multi_cell(pdf, text):
+        # Pre-check encoding so we don't corrupt FPDF's internal state
+        try:
+            text.encode('latin-1')
+            pdf.multi_cell(0, 5, text)
+        except Exception:
+            pdf.multi_cell(0, 5, "[Text contains unsupported characters]")
+
+    @staticmethod
     def generate_pdf(patient_id, patient_name):
         p_dir = PATIENTS_DIR / patient_id
         log_path = p_dir / "transcripts.json"
@@ -240,25 +249,8 @@ class ReportGenerator:
             pdf.cell(0, 5, f"[{entry['timestamp']}] {entry['role'].upper()}:", ln=True)
             pdf.set_font("Arial", "", 10)
             
-            original_text = f"Original: {entry['original']}"
-            translated_text = f"Translated: {entry['translated']}"
-            
-            try:
-                pdf.multi_cell(0, 5, original_text)
-            except Exception:
-                try:
-                    pdf.multi_cell(0, 5, original_text.encode('latin-1', 'replace').decode('latin-1'))
-                except Exception:
-                    pdf.multi_cell(0, 5, "[Original Text contains unsupported characters]")
-                
-            try:
-                pdf.multi_cell(0, 5, translated_text)
-            except Exception:
-                try:
-                    pdf.multi_cell(0, 5, translated_text.encode('latin-1', 'replace').decode('latin-1'))
-                except Exception:
-                    pdf.multi_cell(0, 5, "[Translated Text contains unsupported characters]")
-                
+            ReportGenerator._safe_multi_cell(pdf, f"Original: {entry['original']}")
+            ReportGenerator._safe_multi_cell(pdf, f"Translated: {entry['translated']}")
             pdf.ln(3)
 
         pdf.output(str(pdf_path))
@@ -298,27 +290,8 @@ class ReportGenerator:
             pdf.cell(0, 5, f"[{entry['timestamp']}] {entry['role'].upper()}:", ln=True)
             pdf.set_font("Arial", "", 10)
             
-            # FPDF standard fonts do not support complex Unicode (like Hindi/Kannada)
-            # If it throws an error, fallback to replacing unencodable chars with '?'
-            original_text = f"Original: {entry['original']}"
-            translated_text = f"Translated: {entry['translated']}"
-            
-            try:
-                pdf.multi_cell(0, 5, original_text)
-            except Exception:
-                try:
-                    pdf.multi_cell(0, 5, original_text.encode('latin-1', 'replace').decode('latin-1'))
-                except Exception:
-                    pdf.multi_cell(0, 5, "[Original Text contains unsupported characters]")
-                
-            try:
-                pdf.multi_cell(0, 5, translated_text)
-            except Exception:
-                try:
-                    pdf.multi_cell(0, 5, translated_text.encode('latin-1', 'replace').decode('latin-1'))
-                except Exception:
-                    pdf.multi_cell(0, 5, "[Translated Text contains unsupported characters]")
-                
+            ReportGenerator._safe_multi_cell(pdf, f"Original: {entry['original']}")
+            ReportGenerator._safe_multi_cell(pdf, f"Translated: {entry['translated']}")
             pdf.ln(3)
 
         pdf.output(str(pdf_path))
