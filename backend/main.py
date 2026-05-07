@@ -35,11 +35,18 @@ class TranslationRequest(BaseModel):
     text: str
     direction: str
     lang_key: str
+    doctor_lang_key: str = "English"
 
 class TranscriptEntry(BaseModel):
     role: str
     original: str
     translated: str
+
+class PDFRequest(BaseModel):
+    transcripts: list = None
+
+class CorrectionRequest(BaseModel):
+    text: str
 
 @app.get("/patients/recent")
 async def get_recent_patients():
@@ -101,18 +108,19 @@ async def speech_to_text(
     file: UploadFile = File(...),
     role: str = Form(...),
     lang_key: str = Form(...),
-    patient_id: str = Form(...)
+    patient_id: str = Form(...),
+    doctor_lang_key: str = Form(default="English")
 ):
     # Ensure patient recordings directory exists
     recordings_dir = os.path.join("data", "patients", patient_id, "recordings")
     os.makedirs(recordings_dir, exist_ok=True)
-    
+
     timestamp = int(datetime.now().timestamp())
     temp_path = os.path.join(recordings_dir, f"upload_{role}_{timestamp}.wav")
-    
+
     with open(temp_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
-    
+
     try:
         # Sarvam uses BCP-47 codes (hi-IN), Whisper uses ISO 639-1 (hi)
         sarvam_lang_codes = {
@@ -136,10 +144,57 @@ async def speech_to_text(
             "English": "en"
         }
 
+        # ── Auto-detect speaker from spoken language ──────────────────────────
+        if role == "auto":
+            detected_code = ai.detect_language(temp_path)
+            doctor_code   = whisper_lang_codes.get(doctor_lang_key, "en")
+            patient_code  = whisper_lang_codes.get(lang_key, "hi")
+
+            # Konkani is often detected as Marathi by Whisper — correct for it
+            if detected_code == "mr" and patient_code == "gom":
+                detected_code = "gom"
+            if detected_code == "mr" and doctor_code == "gom":
+                detected_code = "gom"
+
+            if detected_code == doctor_code:
+                role = "doctor"
+            elif detected_code == patient_code:
+                role = "patient"
+            else:
+                # Ambiguous — default to patient
+                print(f"[Auto-detect] '{detected_code}' matched neither "
+                      f"doctor '{doctor_code}' nor patient '{patient_code}'. Defaulting to patient.")
+                role = "patient"
+            print(f"[Auto-detect] resolved role → {role}")
+        # ─────────────────────────────────────────────────────────────────────
+
         if role == "doctor":
-            original = ai.whisper_stt(temp_path, "en")
-            direction = "en_to_native"
+            # Transcribe doctor in their chosen language
+            if doctor_lang_key == "English":
+                original = ai.whisper_stt(temp_path, "en")
+            else:
+                try:
+                    original = ai.sarvam_stt(temp_path, sarvam_lang_codes.get(doctor_lang_key, "hi-IN"))
+                except Exception as sarvam_err:
+                    print(f"[Sarvam STT failed for doctor, falling back to Whisper]: {sarvam_err}")
+                    original = ai.whisper_stt(temp_path, whisper_lang_codes.get(doctor_lang_key, "en"))
+
+            # Translate: doctor_lang → patient_lang
+            # If both are the same, no translation needed
+            if doctor_lang_key == lang_key:
+                translated = original
+            elif doctor_lang_key == "English" and lang_key != "English":
+                # English → native patient language
+                translated = ai.translate(original, "en_to_native", lang_key)
+            elif doctor_lang_key != "English" and lang_key == "English":
+                # Native doctor language → English
+                translated = ai.translate(original, "native_to_en", doctor_lang_key)
+            else:
+                # Native language A → English → Native language B (pivot translation)
+                english_pivot = ai.translate(original, "native_to_en", doctor_lang_key)
+                translated = ai.translate(english_pivot, "en_to_native", lang_key)
         else:
+            # Patient speaking in their language
             if lang_key == "English":
                 original = ai.whisper_stt(temp_path, "en")
             else:
@@ -148,24 +203,39 @@ async def speech_to_text(
                     original = ai.sarvam_stt(temp_path, sarvam_lang_codes.get(lang_key, "hi-IN"))
                 except Exception as sarvam_err:
                     print(f"[Sarvam STT failed, falling back to Whisper]: {sarvam_err}")
-                    # Use correct Whisper language code so it doesn't misidentify the language
                     whisper_lang = whisper_lang_codes.get(lang_key, "hi")
                     original = ai.whisper_stt(temp_path, whisper_lang)
-            direction = "native_to_en"
-            
-        if lang_key == "English":
-            translated = original
-        else:
-            translated = ai.translate(original, direction, lang_key)
+
+            # Translate: patient_lang → doctor_lang
+            if lang_key == doctor_lang_key:
+                translated = original
+            elif lang_key == "English" and doctor_lang_key != "English":
+                translated = ai.translate(original, "en_to_native", doctor_lang_key)
+            elif lang_key != "English" and doctor_lang_key == "English":
+                translated = ai.translate(original, "native_to_en", lang_key)
+            else:
+                # Native language A → English → Native language B (pivot translation)
+                english_pivot = ai.translate(original, "native_to_en", lang_key)
+                translated = ai.translate(english_pivot, "en_to_native", doctor_lang_key)
         
+        # ── Medical transcript correction (LLM post-processing) ────────────
+        original   = ai.correct_transcript(original)
+        # ───────────────────────────────────────────────────────────────────
+
         return {
-            "original": original,
+            "original":   original,
             "translated": translated,
-            "role": role
+            "role":       role
         }
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
+
+@app.post("/correct_transcript")
+async def correct_transcript_endpoint(req: CorrectionRequest):
+    """Standalone endpoint: run any text through the medical correction LLM."""
+    corrected = ai.correct_transcript(req.text)
+    return {"original": req.text, "corrected": corrected}
 
 @app.post("/patients/{patient_id}/append_transcript")
 async def append_transcript(patient_id: str, entry: TranscriptEntry):
@@ -186,18 +256,43 @@ async def append_transcript(patient_id: str, entry: TranscriptEntry):
         
     return {"status": "success"}
 
-@app.get("/patients/{patient_id}/pdf")
-async def get_pdf(patient_id: str):
+@app.post("/patients/{patient_id}/pdf")
+async def get_pdf_with_data(patient_id: str, req: PDFRequest):
+    """Generate PDF from the live transcript data passed by the frontend."""
     p = pm.get_patient(patient_id)
     if not p:
         raise HTTPException(status_code=404, detail="Patient not found")
-    
+
+    pdf_path = ReportGenerator.generate_pdf(patient_id, p["name"], transcripts=req.transcripts)
+    if not pdf_path or not os.path.exists(pdf_path):
+        raise HTTPException(status_code=500, detail="Failed to generate PDF")
+
+    return FileResponse(pdf_path, filename=f"consultation_{patient_id}.pdf")
+
+@app.get("/patients/{patient_id}/pdf")
+async def get_pdf(patient_id: str):
+    """Generate PDF from saved transcripts.json on disk."""
+    p = pm.get_patient(patient_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="Patient not found")
+
     pdf_path = ReportGenerator.generate_pdf(patient_id, p["name"])
     if not pdf_path or not os.path.exists(pdf_path):
         raise HTTPException(status_code=500, detail="Failed to generate PDF")
-        
+
     return FileResponse(pdf_path, filename=f"consultation_{patient_id}.pdf")
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+@app.get("/patients/{patient_id}/archives")
+async def list_archives(patient_id: str):
+    p = pm.get_patient(patient_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="Patient not found")
+    return ReportGenerator.list_archives(patient_id)
+
+@app.get("/patients/{patient_id}/archives/{filename}")
+async def download_archive(patient_id: str, filename: str):
+    archive_path = os.path.join("data", "patients", patient_id, "history", filename)
+    if not os.path.exists(archive_path):
+        raise HTTPException(status_code=404, detail="Archive not found")
+    return FileResponse(archive_path, filename=filename)
+
