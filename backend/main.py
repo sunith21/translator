@@ -8,7 +8,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from datetime import datetime
 from dotenv import load_dotenv
-from backend.services import PatientManager, AIService, ReportGenerator
+from backend.services import PatientManager, AIService, ReportGenerator, EmailService
 
 # Load .env so SARVAM_API_KEY is available
 load_dotenv()
@@ -30,6 +30,7 @@ ai = AIService()
 class PatientCreate(BaseModel):
     id: str
     name: str
+    email: str = ""
 
 class TranslationRequest(BaseModel):
     text: str
@@ -58,7 +59,7 @@ async def search_patients(q: str):
 
 @app.post("/patients")
 async def create_patient(patient: PatientCreate):
-    pm.add_patient(patient.id, patient.name)
+    pm.add_patient(patient.id, patient.name, patient.email)
     return {"status": "success"}
 
 @app.get("/patients/{patient_id}")
@@ -268,6 +269,27 @@ async def get_pdf_with_data(patient_id: str, req: PDFRequest):
         raise HTTPException(status_code=500, detail="Failed to generate PDF")
 
     return FileResponse(pdf_path, filename=f"consultation_{patient_id}.pdf")
+
+@app.post("/patients/{patient_id}/email_report")
+async def email_report(patient_id: str, req: PDFRequest):
+    """Generate PDF and email it to the patient."""
+    p = pm.get_patient(patient_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="Patient not found")
+    if not p.get("email"):
+        raise HTTPException(status_code=400, detail="No email on file for this patient")
+
+    pdf_path = ReportGenerator.generate_pdf(patient_id, p["name"], transcripts=req.transcripts)
+    if not pdf_path or not os.path.exists(pdf_path):
+        raise HTTPException(status_code=500, detail="Failed to generate PDF")
+
+    try:
+        res = EmailService.send_report(p["email"], p["name"], pdf_path)
+        return res
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to send email: {e}")
 
 @app.get("/patients/{patient_id}/pdf")
 async def get_pdf(patient_id: str):

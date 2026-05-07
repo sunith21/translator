@@ -156,7 +156,7 @@ function Dashboard({ onOpenPatient }) {
 }
 
 function NewPatient({ onStart }) {
-  const [formData, setFormData] = useState({ name: '', id: '' });
+  const [formData, setFormData] = useState({ name: '', id: '', email: '' });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
@@ -201,6 +201,16 @@ function NewPatient({ onStart }) {
               placeholder="e.g. P001"
               value={formData.id}
               onChange={e => setFormData({...formData, id: e.target.value})}
+            />
+          </div>
+          <div className="form-group">
+            <label>Email Address (Optional)</label>
+            <input
+              type="email"
+              className="form-input"
+              placeholder="e.g. patient@example.com"
+              value={formData.email}
+              onChange={e => setFormData({...formData, email: e.target.value})}
             />
           </div>
           {error && <p className="error-msg">{error}</p>}
@@ -520,6 +530,26 @@ function Consultation({ patient, onEnd }) {
     }
   };
 
+  const emailPDF = async () => {
+    if (!patient.email) {
+      alert("No email address was provided for this patient.");
+      return;
+    }
+    setStatus('Sending Email…');
+    try {
+      await axios.post(
+        `${API_BASE}/patients/${patient.id}/email_report`,
+        { transcripts: messages }
+      );
+      setStatus('Email sent ✓');
+      alert(`Report successfully emailed to ${patient.email}`);
+    } catch (err) {
+      const msg = err.response?.data?.detail || err.message;
+      setStatus(`Email error: ${msg}`);
+      alert(`Failed to send email: ${msg}`);
+    }
+  };
+
   const openArchives = async () => {
     setShowArchives(true);
     setArchivesLoading(true);
@@ -760,6 +790,9 @@ function Consultation({ patient, onEnd }) {
 
             <button className="btn-outline" onClick={downloadPDF}>
               <FileText size={16} /> Download PDF Report
+            </button>
+            <button className="btn-outline" onClick={emailPDF} disabled={anyBusy} style={{ borderColor: '#10b981', color: '#10b981' }}>
+              <Send size={16} /> Email Report to Patient
             </button>
             <button className="btn-outline" onClick={openArchives} style={{ borderColor: '#818cf8', color: '#818cf8' }}>
               <Archive size={16} /> View Past Archives
