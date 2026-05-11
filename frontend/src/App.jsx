@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import axios from 'axios';
-import { LayoutDashboard, UserPlus, Search, Mic, Square, FileText, History, LogOut, Activity, Clock, User } from 'lucide-react';
+import { LayoutDashboard, UserPlus, Search, Mic, Square, FileText, LogOut, Activity, Clock, User, Send, Keyboard, Archive, X } from 'lucide-react';
 import './App.css';
 
 const API_BASE = 'http://localhost:8000';
@@ -48,6 +48,24 @@ async function blobToWav(blob) {
   return new Blob([wavBuffer], { type: 'audio/wav' });
 }
 
+// Encode raw Float32Array (16kHz mono) → WAV Blob — used by live VAD pipeline
+function encodeWAVFromFloat32(samples, sampleRate = 16000) {
+  const n = samples.length;
+  const buf = new ArrayBuffer(44 + n * 2);
+  const v = new DataView(buf);
+  const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  w(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true);
+  w(8, 'WAVE'); w(12, 'fmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, sampleRate, true); v.setUint32(28, sampleRate * 2, true);
+  v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  w(36, 'data'); v.setUint32(40, n * 2, true);
+  for (let i = 0; i < n; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    v.setInt16(44 + i * 2, s * 32767, true);
+  }
+  return new Blob([buf], { type: 'audio/wav' });
+}
 
 function App() {
   const [view, setView] = useState('dashboard');
@@ -86,7 +104,7 @@ function App() {
         {view === 'dashboard' && <Dashboard onOpenPatient={(p) => navigateTo('consultation', p)} />}
         {view === 'new-patient' && <NewPatient onStart={(p) => navigateTo('consultation', p)} />}
         {view === 'search' && <SearchPatient onOpenPatient={(p) => navigateTo('consultation', p)} />}
-        {view === 'consultation' && <Consultation patient={currentPatient} onEnd={() => navigateTo('dashboard')} />}
+        {view === 'consultation' && <Consultation key={currentPatient.id} patient={currentPatient} onEnd={() => navigateTo('dashboard')} />}
       </main>
     </div>
   );
@@ -138,7 +156,7 @@ function Dashboard({ onOpenPatient }) {
 }
 
 function NewPatient({ onStart }) {
-  const [formData, setFormData] = useState({ name: '', id: '' });
+  const [formData, setFormData] = useState({ name: '', id: '', email: '' });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
@@ -183,6 +201,16 @@ function NewPatient({ onStart }) {
               placeholder="e.g. P001"
               value={formData.id}
               onChange={e => setFormData({...formData, id: e.target.value})}
+            />
+          </div>
+          <div className="form-group">
+            <label>Email Address (Optional)</label>
+            <input
+              type="email"
+              className="form-input"
+              placeholder="e.g. patient@example.com"
+              value={formData.email}
+              onChange={e => setFormData({...formData, email: e.target.value})}
             />
           </div>
           {error && <p className="error-msg">{error}</p>}
@@ -244,19 +272,53 @@ function SearchPatient({ onOpenPatient }) {
 }
 
 function Consultation({ patient, onEnd }) {
-  const [messages, setMessages] = useState([]);
-  const [isRecording, setIsRecording] = useState(false);
-  const [isProcessing, setIsProcessing] = useState(false);
-  const [currentRole, setCurrentRole] = useState(null);
-  const [langKey, setLangKey] = useState('Hindi (हिन्दी)');
-  const [status, setStatus] = useState('Ready');
-  const mediaRecorder = useRef(null);
-  const audioChunks = useRef([]);
-  const langKeyRef = useRef(langKey);
-  const chatEndRef = useRef(null);
+  const [messages, setMessages]           = useState([]);
+  const [isRecording, setIsRecording]     = useState(false);
+  const [isProcessing, setIsProcessing]   = useState(false);
+  const [currentRole, setCurrentRole]     = useState(null);
+  const [langKey, setLangKey]             = useState('Hindi (हिन्दी)');
+  const [doctorLang, setDoctorLang]       = useState('English');
+  const [status, setStatus]               = useState('Ready');
+  const [patientText, setPatientText]     = useState('');
+  const [isTranslatingText, setIsTranslatingText] = useState(false);
+  const [showArchives, setShowArchives]   = useState(false);
+  const [archives, setArchives]           = useState([]);
+  const [archivesLoading, setArchivesLoading] = useState(false);
+  const [autoDetect, setAutoDetect]       = useState(true);
 
-  // Keep ref in sync with state so closures always see latest value
+  // Live / VAD state
+  const [isLive, setIsLive]       = useState(false);
+  const [liveRole, setLiveRole]   = useState('doctor');
+  const [vadState, setVadState]   = useState('idle'); // idle | listening | speaking | processing
+  const [audioLevel, setAudioLevel] = useState(0);
+  const [queueLen, setQueueLen]   = useState(0);
+  const [vadThreshold, setVadThreshold] = useState(0.025);
+
+  // Refs
+  const mediaRecorder   = useRef(null);
+  const audioChunks     = useRef([]);
+  const chatEndRef      = useRef(null);
+  
+  // Live VAD refs
+  const liveCtxRef = useRef(null);
+  const liveProcessorRef = useRef(null);
+  const liveStreamRef = useRef(null);
+  const vadQueue = useRef([]);
+  const vadProcessing = useRef(false);
+  
+  // Ensure the audio processor uses the latest role, language, and threshold
+  const currentRoleRef   = useRef(currentRole);
+  const langKeyRef       = useRef(langKey);
+  const doctorLangRef    = useRef(doctorLang);
+  const liveRoleRef      = useRef(liveRole);
+  const vadThresholdRef  = useRef(vadThreshold);
+  const autoDetectRef    = useRef(autoDetect);
+  useEffect(() => { currentRoleRef.current = currentRole; }, [currentRole]);
   useEffect(() => { langKeyRef.current = langKey; }, [langKey]);
+  useEffect(() => { doctorLangRef.current = doctorLang; }, [doctorLang]);
+  useEffect(() => { liveRoleRef.current = liveRole; }, [liveRole]);
+  useEffect(() => { vadThresholdRef.current = vadThreshold; }, [vadThreshold]);
+  useEffect(() => { autoDetectRef.current = autoDetect; }, [autoDetect]);
 
   useEffect(() => {
     axios.get(`${API_BASE}/patients/${patient.id}/transcripts`)
@@ -268,96 +330,335 @@ function Consultation({ patient, onEnd }) {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
+  // Cleanup live session on unmount
+  useEffect(() => () => stopLive(), []);
+
+  // ── Process queued VAD segments one-by-one ──
+  const drainQueue = async (pid) => {
+    if (vadProcessing.current || vadQueue.current.length === 0) return;
+    vadProcessing.current = true;
+    const { samples, role, lk, dlk } = vadQueue.current.shift();
+    setQueueLen(vadQueue.current.length);
+    setVadState('processing');
+    setStatus(role === 'auto' ? 'Auto-detecting speaker…' : `Processing ${role} speech…`);
+    try {
+      const wav = encodeWAVFromFloat32(samples);
+      const fd  = new FormData();
+      fd.append('file', wav, 'recording.wav');
+      fd.append('role', role);
+      fd.append('lang_key', lk);
+      fd.append('doctor_lang_key', dlk);
+      fd.append('patient_id', pid);
+      const res = await axios.post(`${API_BASE}/stt`, fd);
+      const resolvedRole = res.data.role || role;
+      const entry = { role: resolvedRole, original: res.data.original, translated: res.data.translated };
+      await axios.post(`${API_BASE}/patients/${pid}/append_transcript`, entry);
+      setMessages(prev => [...prev, { ...entry, timestamp: new Date().toLocaleTimeString() }]);
+      setStatus(`Done ✓ — ${resolvedRole.charAt(0).toUpperCase() + resolvedRole.slice(1)} detected`);
+    } catch (err) {
+      setStatus(`Error: ${err.response?.data?.detail || err.message}`);
+    } finally {
+      vadProcessing.current = false;
+      if (vadQueue.current.length > 0) drainQueue(pid);
+      else setVadState('listening');
+    }
+  };
+
+  // ── Start live VAD session ──
+  const startLive = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      liveStreamRef.current = stream;
+      const RATE = 16000;
+      const ctx  = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: RATE });
+      liveCtxRef.current = ctx;
+      const src  = ctx.createMediaStreamSource(stream);
+      const proc = ctx.createScriptProcessor(4096, 1, 1);
+      liveProcessorRef.current = proc;
+
+      const SILENCE_MS = 1500;    // silence duration before segment commit
+      const MIN_MS     = 350;     // minimum speech duration
+
+      let speaking     = false;
+      let silenceStart = null;
+      let speechBuf    = [];
+      let speechStartMs= 0;
+      let levelThrottle= 0;
+
+      proc.onaudioprocess = (e) => {
+        const data = e.inputBuffer.getChannelData(0);
+        let sum = 0;
+        for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
+        const rms = Math.sqrt(sum / data.length);
+        const now = Date.now();
+
+        // Throttle level updates to ~10 fps
+        const currentThresh = vadThresholdRef.current;
+        if (now - levelThrottle > 100) {
+          setAudioLevel(Math.min(1, rms / currentThresh));
+          levelThrottle = now;
+        }
+
+        if (rms > currentThresh) {
+          if (!speaking) {
+            speaking = true; silenceStart = null;
+            speechBuf = []; speechStartMs = now;
+            setVadState('speaking');
+          }
+          speechBuf.push(Float32Array.from(data));
+          silenceStart = null;
+        } else if (speaking) {
+          speechBuf.push(Float32Array.from(data));
+          if (!silenceStart) { silenceStart = now; }
+          else if (now - silenceStart > SILENCE_MS) {
+            speaking = false;
+            if (now - speechStartMs > MIN_MS) {
+              const total = speechBuf.reduce((a, b) => a + b.length, 0);
+              const combined = new Float32Array(total);
+              let off = 0;
+              for (const c of speechBuf) { combined.set(c, off); off += c.length; }
+              vadQueue.current.push({
+                samples: combined,
+                role: autoDetectRef.current ? 'auto' : liveRoleRef.current,
+                lk: langKeyRef.current,
+                dlk: doctorLangRef.current
+              });
+              setQueueLen(vadQueue.current.length);
+              drainQueue(patient.id);
+            }
+            speechBuf = []; silenceStart = null;
+            setVadState('listening');
+          }
+        }
+      };
+
+      src.connect(proc);
+      proc.connect(ctx.destination);
+      setIsLive(true);
+      setVadState('listening');
+      setStatus('Live session active — speak now');
+    } catch (err) {
+      setStatus(`Live mode error: ${err.message}`);
+    }
+  };
+
+  const stopLive = () => {
+    liveProcessorRef.current?.disconnect();
+    liveCtxRef.current?.close();
+    liveStreamRef.current?.getTracks().forEach(t => t.stop());
+    liveCtxRef.current = liveProcessorRef.current = liveStreamRef.current = null;
+    vadQueue.current = []; vadProcessing.current = false;
+    setIsLive(false); setVadState('idle'); setAudioLevel(0); setQueueLen(0);
+    setStatus('Live session ended');
+  };
+
+  // ── Manual recording ──
   const startRecording = async (role) => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       mediaRecorder.current = new MediaRecorder(stream);
       audioChunks.current = [];
-
-      mediaRecorder.current.ondataavailable = (e) => {
-        if (e.data.size > 0) audioChunks.current.push(e.data);
-      };
-
+      mediaRecorder.current.ondataavailable = (e) => { if (e.data.size > 0) audioChunks.current.push(e.data); };
       mediaRecorder.current.onstop = async () => {
-        // Stop all tracks to release mic
         stream.getTracks().forEach(t => t.stop());
-
-        setIsRecording(false);
-        setIsProcessing(true);
-        setStatus('Converting audio…');
-
+        setIsRecording(false); setIsProcessing(true); setStatus('Encoding WAV…');
         try {
-          const rawBlob = new Blob(audioChunks.current);  // browser-native format (webm/ogg)
-          
-          // Convert to 16kHz mono WAV so backend can read without ffmpeg
-          setStatus('Encoding WAV…');
-          const wavBlob = await blobToWav(rawBlob);
-
-          const formData = new FormData();
-          formData.append('file', wavBlob, 'recording.wav');
-          formData.append('role', role);
-          formData.append('lang_key', langKeyRef.current);  // use ref, not stale closure
-
+          const wav = await blobToWav(new Blob(audioChunks.current));
+          const fd  = new FormData();
+          fd.append('file', wav, 'recording.wav');
+          fd.append('role', role);
+          fd.append('lang_key', langKeyRef.current);
+          fd.append('doctor_lang_key', doctorLangRef.current);
+          fd.append('patient_id', patient.id);
           setStatus('Transcribing & translating…');
-          const res = await axios.post(`${API_BASE}/stt`, formData);
-          const { original, translated } = res.data;
-
-          const entry = { role, original, translated };
+          const res   = await axios.post(`${API_BASE}/stt`, fd);
+          const entry = { role, original: res.data.original, translated: res.data.translated };
           await axios.post(`${API_BASE}/patients/${patient.id}/append_transcript`, entry);
-
           setMessages(prev => [...prev, { ...entry, timestamp: new Date().toLocaleTimeString() }]);
           setStatus('Done ✓');
         } catch (err) {
-          const msg = err.response?.data?.detail || err.message;
-          setStatus(`Error: ${msg}`);
-        } finally {
-          setIsProcessing(false);
-          setCurrentRole(null);
-        }
+          setStatus(`Error: ${err.response?.data?.detail || err.message}`);
+        } finally { setIsProcessing(false); setCurrentRole(null); }
       };
-
       mediaRecorder.current.start();
-      setIsRecording(true);
-      setCurrentRole(role);
+      setIsRecording(true); setCurrentRole(role);
       setStatus(`Recording ${role === 'doctor' ? 'Doctor' : 'Patient'}… click Stop when done`);
-    } catch (err) {
-      setStatus('Microphone access denied. Please allow mic permissions.');
-    }
+    } catch { setStatus('Microphone access denied.'); }
   };
 
   const stopRecording = () => {
-    if (mediaRecorder.current && mediaRecorder.current.state !== 'inactive') {
-      mediaRecorder.current.stop();
+    if (mediaRecorder.current?.state !== 'inactive') mediaRecorder.current.stop();
+  };
+
+  const submitPatientText = async () => {
+    if (!patientText.trim()) return;
+    setIsTranslatingText(true); setStatus('Translating patient text…');
+    try {
+      const res = await axios.post(`${API_BASE}/text_chat`, {
+        patient_id: patient.id,
+        text: patientText,
+        role: 'patient',
+        lang_key: langKey,
+        doctor_lang_key: doctorLang,
+      });
+      const entry = { role: 'patient', original: patientText, translated: res.data.translated };
+      await axios.post(`${API_BASE}/patients/${patient.id}/append_transcript`, entry);
+      setMessages(prev => [...prev, { ...entry, timestamp: new Date().toLocaleTimeString() }]);
+      setPatientText(''); setStatus('Done ✓');
+    } catch (err) {
+      setStatus(`Text error: ${err.response?.data?.detail || err.message}`);
+    } finally { setIsTranslatingText(false); }
+  };
+
+  const downloadPDF = async () => {
+    setStatus('Generating PDF…');
+    try {
+      const res = await axios.post(
+        `${API_BASE}/patients/${patient.id}/pdf`,
+        { transcripts: messages },
+        { responseType: 'blob' }
+      );
+      const url = URL.createObjectURL(res.data);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `consultation_${patient.id}.pdf`;
+      a.click();
+      URL.revokeObjectURL(url);
+      setStatus('PDF downloaded ✓');
+    } catch (err) {
+      setStatus(`PDF error: ${err.response?.data?.detail || err.message}`);
     }
   };
 
-  const downloadPDF = () => {
-    window.open(`${API_BASE}/patients/${patient.id}/pdf`, '_blank');
+  const emailPDF = async () => {
+    if (!patient.email) {
+      alert("No email address was provided for this patient.");
+      return;
+    }
+    setStatus('Sending Email…');
+    try {
+      await axios.post(
+        `${API_BASE}/patients/${patient.id}/email_report`,
+        { transcripts: messages }
+      );
+      setStatus('Email sent ✓');
+      alert(`Report successfully emailed to ${patient.email}`);
+    } catch (err) {
+      const msg = err.response?.data?.detail || err.message;
+      setStatus(`Email error: ${msg}`);
+      alert(`Failed to send email: ${msg}`);
+    }
+  };
+
+  const openArchives = async () => {
+    setShowArchives(true);
+    setArchivesLoading(true);
+    try {
+      const res = await axios.get(`${API_BASE}/patients/${patient.id}/archives`);
+      setArchives(res.data);
+    } catch {
+      setArchives([]);
+    } finally {
+      setArchivesLoading(false);
+    }
+  };
+
+  const downloadArchive = (filename) => {
+    window.open(`${API_BASE}/patients/${patient.id}/archives/${filename}`, '_blank');
+  };
+  
+  const clearChat = async () => {
+    if (!window.confirm("Are you sure you want to clear this chat? It will be archived securely as a PDF.")) return;
+    setIsProcessing(true);
+    setStatus('Archiving chat…');
+    try {
+      await axios.post(`${API_BASE}/patients/${patient.id}/clear_chat`);
+      setMessages([]);
+      setStatus('Chat cleared and archived ✓');
+    } catch (err) {
+      setStatus(`Error clearing chat: ${err.response?.data?.detail || err.message}`);
+    } finally {
+      setIsProcessing(false);
+    }
   };
 
   const busy = isRecording || isProcessing;
+  const anyBusy = busy || isTranslatingText;
+
+  const vadLabel = { idle: '', listening: '👂 Listening…', speaking: '🔴 Speech detected', processing: '⚙️ Processing…' }[vadState];
 
   return (
     <div className="consultation-page animate-in">
+      {/* Archives Modal */}
+      {showArchives && (
+        <div className="modal-overlay" onClick={() => setShowArchives(false)}>
+          <div className="modal-box" onClick={e => e.stopPropagation()}>
+            <div className="modal-header">
+              <Archive size={18} />
+              <span>Past Consultation Archives</span>
+              <button className="modal-close" onClick={() => setShowArchives(false)}><X size={18} /></button>
+            </div>
+            <div className="modal-body">
+              {archivesLoading ? (
+                <p className="empty-state">Loading…</p>
+              ) : archives.length === 0 ? (
+                <p className="empty-state">No archived consultations found for this patient.</p>
+              ) : (
+                <div className="archive-list">
+                  {archives.map((a, i) => (
+                    <div key={i} className="archive-row">
+                      <div className="archive-info">
+                        <FileText size={15} className="accent-icon" />
+                        <div>
+                          <div className="archive-date">{a.archived_at}</div>
+                          <div className="archive-size">{a.size_kb} KB</div>
+                        </div>
+                      </div>
+                      <button className="btn-primary btn-sm" onClick={() => downloadArchive(a.filename)}>
+                        Download
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
       {/* Header */}
       <div className="consult-header card">
         <div>
-          <h2 style={{ margin: 0 }}>{patient.name}</h2>
-          <span className="patient-id">Patient ID: {patient.id}</span>
+          <h2 style={{ margin: '0 0 0.3rem', fontSize: '1.4rem' }}>{patient.name}</h2>
+          <span style={{ fontSize: '0.85rem', color: '#64748b' }}>ID: {patient.id}</span>
         </div>
-        <div className="lang-selector-wrap">
-          <label>Language</label>
-          <select
-            className="lang-select"
-            value={langKey}
-            onChange={e => setLangKey(e.target.value)}
-            disabled={busy}
-          >
-            <option>Hindi (हिन्दी)</option>
-            <option>Kannada (ಕನ್ನಡ)</option>
-            <option>Marathi (मराठी)</option>
-            <option>Bengali (বাংলা)</option>
-          </select>
+        <div className="lang-selectors-wrap">
+          <div className="lang-selector-group">
+            <label>👨‍⚕️ Doctor's Language</label>
+            <select className="lang-select doctor-lang-select" value={doctorLang} onChange={e => setDoctorLang(e.target.value)} disabled={anyBusy || isLive}>
+              <option>English</option>
+              <option>Hindi (हिन्दी)</option>
+              <option>Kannada (ಕನ್ನಡ)</option>
+              <option>Marathi (मराठी)</option>
+              <option>Bengali (বাংলা)</option>
+              <option>Malayalam (മലയാളം)</option>
+              <option>Tamil (தமிழ்)</option>
+              <option>Konkani (कोंकणी)</option>
+            </select>
+          </div>
+          <div className="lang-direction-arrow">⇄</div>
+          <div className="lang-selector-group">
+            <label>🧑‍⚕️ Patient's Language</label>
+            <select className="lang-select" value={langKey} onChange={e => setLangKey(e.target.value)} disabled={anyBusy || isLive}>
+              <option>Hindi (हिन्दी)</option>
+              <option>Kannada (ಕನ್ನಡ)</option>
+              <option>Marathi (मराठी)</option>
+              <option>Bengali (বাংলা)</option>
+              <option>Malayalam (മലയാളം)</option>
+              <option>Tamil (தமிழ்)</option>
+              <option>Konkani (कोंकणी)</option>
+              <option>English</option>
+            </select>
+          </div>
         </div>
       </div>
 
@@ -365,9 +666,7 @@ function Consultation({ patient, onEnd }) {
         {/* Chat Panel */}
         <div className="card chat-panel">
           <div className="chat-box">
-            {messages.length === 0 && (
-              <p className="empty-state">No messages yet. Use the buttons below to start speaking.</p>
-            )}
+            {messages.length === 0 && <p className="empty-state">No messages yet. Use Live Session or the buttons below.</p>}
             {messages.map((m, i) => (
               <div key={i} className={`message ${m.role}`}>
                 <div className="message-header">
@@ -382,29 +681,85 @@ function Consultation({ patient, onEnd }) {
           </div>
 
           {/* Status bar */}
-          <div className={`status-bar ${isProcessing ? 'processing' : ''}`}>
-            {isProcessing && <span className="spinner" />}
+          <div className={`status-bar ${(isProcessing || isTranslatingText || vadState === 'processing') ? 'processing' : ''}`}>
+            {(isProcessing || isTranslatingText || vadState === 'processing') && <span className="spinner" />}
             {status}
+            {queueLen > 0 && <span className="queue-badge">{queueLen} queued</span>}
           </div>
 
-          {/* Recording controls */}
-          <div className="controls">
-            <button
-              className={`btn-record ${currentRole === 'doctor' && isRecording ? 'recording' : ''}`}
-              onClick={isRecording ? stopRecording : () => startRecording('doctor')}
-              disabled={busy && currentRole !== 'doctor'}
-            >
-              {currentRole === 'doctor' && isRecording ? <Square size={20} /> : <Mic size={20} />}
-              {currentRole === 'doctor' && isRecording ? '■ Stop Doctor' : '🎤 Doctor Speak'}
-            </button>
-            <button
-              className={`btn-record ${currentRole === 'patient' && isRecording ? 'recording' : ''}`}
-              onClick={isRecording ? stopRecording : () => startRecording('patient')}
-              disabled={busy && currentRole !== 'patient'}
-            >
-              {currentRole === 'patient' && isRecording ? <Square size={20} /> : <Mic size={20} />}
-              {currentRole === 'patient' && isRecording ? '■ Stop Patient' : '🎤 Patient Speak'}
-            </button>
+          {/* ── LIVE SESSION PANEL ── */}
+          <div className={`live-panel ${isLive ? 'live-active' : ''}`}>
+            <div className="live-panel-header">
+              <div className="live-title-row">
+                <span className={`live-dot ${isLive ? vadState : ''}`} />
+                <span className="live-title-text">Live Session</span>
+                {isLive && <span className="vad-label-text">{vadLabel}</span>}
+              </div>
+              <button
+                className={`btn-live ${isLive ? 'stop' : 'start'}`}
+                onClick={isLive ? stopLive : startLive}
+                disabled={anyBusy}
+              >
+                {isLive ? '⏹ Stop Live' : '🎙️ Start Live Session'}
+              </button>
+            </div>
+
+            {isLive && (
+              <div className="live-controls">
+                {/* Auto-detect toggle */}
+                <div className="live-autodetect-row">
+                  <span className="live-role-label">Speaker detection:</span>
+                  <button
+                    className={`btn-autodetect ${autoDetect ? 'active' : ''}`}
+                    onClick={() => setAutoDetect(v => !v)}
+                  >
+                    {autoDetect ? '🤖 Auto-detecting' : '👤 Manual'}
+                  </button>
+                </div>
+
+                {/* Manual role override — only shown when auto-detect is OFF */}
+                {!autoDetect && (
+                  <div className="live-role-row">
+                    <span className="live-role-label">Who is speaking?</span>
+                    <button className={`btn-role-live ${liveRole === 'doctor' ? 'active-doc' : ''}`} onClick={() => setLiveRole('doctor')}>Doctor</button>
+                    <button className={`btn-role-live ${liveRole === 'patient' ? 'active-pat' : ''}`} onClick={() => setLiveRole('patient')}>Patient</button>
+                  </div>
+                )}
+
+                <div className="audio-meter-wrap">
+                  <div className="audio-meter-bar">
+                    <div
+                      className={`audio-meter-fill ${vadState === 'speaking' ? 'speaking' : ''}`}
+                      style={{ width: `${Math.min(100, audioLevel * 100)}%` }}
+                    />
+                  </div>
+                  <span className="audio-meter-label">mic level</span>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Patient text input */}
+          <div className="patient-text-panel">
+            <div className="patient-text-header">
+              <Keyboard size={15} />
+              <span>Patient — Type Message</span>
+              <span className="lang-badge">{langKey.split(' ')[0]}</span>
+            </div>
+            <div className="patient-text-row">
+              <textarea
+                className="patient-textarea"
+                placeholder={`Type patient's message in ${langKey.split('(')[0].trim()}…`}
+                value={patientText}
+                onChange={e => setPatientText(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submitPatientText(); } }}
+                disabled={anyBusy}
+                rows={2}
+              />
+              <button className="btn-send" onClick={submitPatientText} disabled={!patientText.trim() || anyBusy}>
+                <Send size={16} />
+              </button>
+            </div>
           </div>
         </div>
 
@@ -412,10 +767,40 @@ function Consultation({ patient, onEnd }) {
         <div className="session-sidebar">
           <div className="card sidebar-card">
             <h4>Session Tools</h4>
+            
+            <div className="form-group" style={{ marginBottom: '15px' }}>
+              <label style={{ fontSize: '12px', display: 'flex', justifyContent: 'space-between' }}>
+                <span>Noise Filter:</span>
+                <span>{Math.round(vadThreshold * 1000)}</span>
+              </label>
+              <input 
+                type="range" 
+                min="0.005" 
+                max="0.08" 
+                step="0.001" 
+                value={vadThreshold} 
+                onChange={(e) => setVadThreshold(parseFloat(e.target.value))}
+                title="Increase to ignore background noise (fans, hums). Decrease to pick up quiet voices."
+                style={{ width: '100%', cursor: 'pointer' }}
+              />
+              <span style={{ fontSize: '11px', color: '#64748b' }}>
+                Higher = Ignores more background noise
+              </span>
+            </div>
+
             <button className="btn-outline" onClick={downloadPDF}>
               <FileText size={16} /> Download PDF Report
             </button>
-            <button className="btn-danger" onClick={onEnd} disabled={busy}>
+            <button className="btn-outline" onClick={emailPDF} disabled={anyBusy} style={{ borderColor: '#10b981', color: '#10b981' }}>
+              <Send size={16} /> Email Report to Patient
+            </button>
+            <button className="btn-outline" onClick={openArchives} style={{ borderColor: '#818cf8', color: '#818cf8' }}>
+              <Archive size={16} /> View Past Archives
+            </button>
+            <button className="btn-outline" onClick={clearChat} disabled={anyBusy} style={{ borderColor: '#f59e0b', color: '#f59e0b' }}>
+              <Square size={16} /> Clear Chat & Archive
+            </button>
+            <button className="btn-danger" onClick={onEnd} disabled={anyBusy}>
               <LogOut size={16} /> End Session
             </button>
           </div>

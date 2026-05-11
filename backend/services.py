@@ -62,20 +62,26 @@ class PatientManager:
                 CREATE TABLE IF NOT EXISTS patients (
                     id TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
+                    email TEXT DEFAULT '',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     last_visit TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            # Migrate existing databases that lack the email column
+            try:
+                conn.execute("ALTER TABLE patients ADD COLUMN email TEXT DEFAULT ''")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
 
-    def add_patient(self, patient_id, name):
+    def add_patient(self, patient_id, name, email=""):
         with sqlite3.connect(self.db_path) as conn:
-            conn.execute("INSERT OR REPLACE INTO patients (id, name, last_visit) VALUES (?, ?, ?)",
-                         (patient_id, name, datetime.now()))
-        
+            conn.execute(
+                "INSERT OR REPLACE INTO patients (id, name, email, last_visit) VALUES (?, ?, ?, ?)",
+                (patient_id, name, email, datetime.now())
+            )
         p_dir = PATIENTS_DIR / patient_id
         p_dir.mkdir(exist_ok=True)
         (p_dir / "recordings").mkdir(exist_ok=True)
-        
         log_path = p_dir / "transcripts.json"
         if not log_path.exists():
             with open(log_path, "w", encoding="utf-8") as f:
@@ -83,32 +89,184 @@ class PatientManager:
 
     def get_patient(self, patient_id):
         with sqlite3.connect(self.db_path) as conn:
-            res = conn.execute("SELECT id, name, last_visit FROM patients WHERE id = ?", (patient_id,)).fetchone()
+            res = conn.execute(
+                "SELECT id, name, email, last_visit FROM patients WHERE id = ?",
+                (patient_id,)
+            ).fetchone()
             if res:
-                return {"id": res[0], "name": res[1], "last_visit": res[2]}
+                return {"id": res[0], "name": res[1], "email": res[2] or "", "last_visit": res[3]}
         return None
 
     def search_patients(self, query):
         with sqlite3.connect(self.db_path) as conn:
-            res = conn.execute("SELECT id, name FROM patients WHERE id LIKE ? OR name LIKE ? LIMIT 10",
-                               (f"%{query}%", f"%{query}%")).fetchall()
-            return [{"id": r[0], "name": r[1]} for r in res]
+            res = conn.execute(
+                "SELECT id, name, email FROM patients WHERE id LIKE ? OR name LIKE ? LIMIT 10",
+                (f"%{query}%", f"%{query}%")
+            ).fetchall()
+            return [{"id": r[0], "name": r[1], "email": r[2] or ""} for r in res]
 
     def get_recent_patients(self):
         with sqlite3.connect(self.db_path) as conn:
-            res = conn.execute("SELECT id, name, last_visit FROM patients ORDER BY last_visit DESC LIMIT 10").fetchall()
-            return [{"id": r[0], "name": r[1], "last_visit": r[2]} for r in res]
+            res = conn.execute(
+                "SELECT id, name, email, last_visit FROM patients ORDER BY last_visit DESC LIMIT 10"
+            ).fetchall()
+            return [{"id": r[0], "name": r[1], "email": r[2] or "", "last_visit": r[3]} for r in res]
 
     def update_last_visit(self, patient_id):
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("UPDATE patients SET last_visit = ? WHERE id = ?", (datetime.now(), patient_id))
 
 # ─────────────────────────────────────────────
+#  Email Service
+# ─────────────────────────────────────────────
+class EmailService:
+    """Sends PDF consultation reports to the patient's email via SMTP.
+    Configure via environment variables:
+        SMTP_HOST   (default: smtp.gmail.com)
+        SMTP_PORT   (default: 587)
+        SMTP_USER   - your Gmail / SMTP account address
+        SMTP_PASS   - Gmail App Password (NOT your regular password)
+        SMTP_FROM   - display name + address, e.g. 'Clinic AI <you@gmail.com>'
+    """
+
+    @staticmethod
+    def send_report(to_email: str, patient_name: str, pdf_path: str) -> dict:
+        import smtplib
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.text   import MIMEText
+        from email.mime.base   import MIMEBase
+        from email             import encoders
+
+        smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+        smtp_port = int(os.environ.get("SMTP_PORT", 587))
+        smtp_user = os.environ.get("SMTP_USER", "")
+        smtp_pass = os.environ.get("SMTP_PASS", "")
+        smtp_from = os.environ.get("SMTP_FROM", smtp_user)
+
+        if not smtp_user or not smtp_pass:
+            raise ValueError(
+                "SMTP_USER and SMTP_PASS must be set in the .env file. "
+                "For Gmail, generate an App Password at myaccount.google.com/apppasswords."
+            )
+
+        if not os.path.exists(pdf_path):
+            raise FileNotFoundError(f"PDF not found at {pdf_path}")
+
+        msg = MIMEMultipart()
+        msg["From"]    = smtp_from
+        msg["To"]      = to_email
+        msg["Subject"] = f"Your Medical Consultation Report — {patient_name}"
+
+        body = f"""Dear {patient_name},
+
+Please find attached your medical consultation report from your recent visit.
+
+This report contains a transcript of your consultation along with translations 
+to assist you in understanding the discussion with your doctor.
+
+If you have any questions, please contact the clinic directly.
+
+Warm regards,
+Clinic AI | Multilingual Medical Assistant"""
+
+        msg.attach(MIMEText(body, "plain", "utf-8"))
+
+        with open(pdf_path, "rb") as f:
+            part = MIMEBase("application", "octet-stream")
+            part.set_payload(f.read())
+        encoders.encode_base64(part)
+        filename = os.path.basename(pdf_path)
+        part.add_header("Content-Disposition", f'attachment; filename="{filename}"')
+        msg.attach(part)
+
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
+            server.ehlo()
+            server.starttls()
+            server.login(smtp_user, smtp_pass)
+            server.sendmail(smtp_user, to_email, msg.as_string())
+
+        print(f"[EmailService] Report sent to {to_email}")
+        return {"status": "sent", "to": to_email}
+
+# ─────────────────────────────────────────────
 #  AI Service
 # ─────────────────────────────────────────────
 class AIService:
-    SARVAM_STT_URL = "https://api.sarvam.ai/speech-to-text"
-    SARVAM_TTS_URL = "https://api.sarvam.ai/text-to-speech"
+    SARVAM_STT_URL  = "https://api.sarvam.ai/speech-to-text"
+    SARVAM_TTS_URL  = "https://api.sarvam.ai/text-to-speech"
+    SARVAM_CHAT_URL = "https://api.sarvam.ai/v1/chat/completions"
+
+    _CORRECTION_SYSTEM_PROMPT = """You are an advanced medical transcript correction assistant.
+
+Your task is to correct speech-to-text transcription errors in a multilingual doctor-patient conversation while preserving the ORIGINAL medical meaning exactly.
+
+Rules:
+- Do NOT summarize.
+- Do NOT invent symptoms, diagnoses, or medications.
+- Do NOT add medical assumptions.
+- Correct only probable transcription mistakes.
+- Preserve patient intent and tone.
+- Keep medical terminology accurate.
+- Expand unclear phrases only when highly certain from context.
+- Maintain proper punctuation and sentence structure.
+- Preserve all numbers, dosages, durations, and measurements carefully.
+- If a word is uncertain, keep the original instead of hallucinating.
+
+Context:
+This transcript may contain:
+- medical symptoms
+- medication names
+- disease names
+- body parts
+- multilingual accents
+- Indian English pronunciation
+- casual patient wording
+
+Common medical vocabulary includes:
+diabetes, hypertension, asthma, migraine, fever, nausea,
+paracetamol, ibuprofen, insulin, blood pressure, chest pain,
+infection, allergy, dizziness, cough, cold, weakness,
+stomach pain, headache, breathing difficulty, swelling
+
+Return ONLY the corrected transcript text with no extra commentary."""
+
+    @staticmethod
+    def correct_transcript(text: str) -> str:
+        """Send STT text through Sarvam's LLM for medical transcription correction."""
+        api_key = os.environ.get("SARVAM_API_KEY", "")
+        if not api_key:
+            print("[correct_transcript] No SARVAM_API_KEY — skipping correction.")
+            return text
+        try:
+            payload = {
+                "model": "sarvam-m",
+                "messages": [
+                    {"role": "system", "content": AIService._CORRECTION_SYSTEM_PROMPT},
+                    {"role": "user",   "content": f'"""\n{text}\n"""'}
+                ],
+                "temperature": 0.1,
+                "max_tokens": 512,
+            }
+            resp = requests.post(
+                AIService.SARVAM_CHAT_URL,
+                headers={
+                    "api-subscription-key": api_key,
+                    "Content-Type": "application/json"
+                },
+                json=payload,
+                timeout=20
+            )
+            resp.raise_for_status()
+            corrected = resp.json()["choices"][0]["message"]["content"].strip()
+            # Safety: if the LLM returns empty or something wildly longer, keep original
+            if not corrected or len(corrected) > len(text) * 3:
+                return text
+            print(f"[correct_transcript] '{text}' → '{corrected}'")
+            return corrected
+        except Exception as e:
+            print(f"[correct_transcript] failed: {e} — using original text")
+            return text
+
 
     @staticmethod
     def translate(text, direction, lang_key):
@@ -152,7 +310,10 @@ class AIService:
         codes = {
             "Kannada (ಕನ್ನಡ)": "kan_Knda",
             "Marathi (मराठी)": "mar_Deva",
-            "Bengali (বাংলা)": "ben_Beng"
+            "Bengali (বাংলা)": "ben_Beng",
+            "Malayalam (മലയാളം)": "mal_Mlym",
+            "Tamil (தமிழ்)": "tam_Taml",
+            "Konkani (कोंकणी)": "mar_Deva"  # Fallback to Marathi as NLLB lacks Konkani
         }
         return codes.get(lang_key, "hin_Deva")
 
@@ -170,48 +331,235 @@ class AIService:
         return response.json().get("transcript", "").strip()
 
     @staticmethod
-    def whisper_stt(wav_path, lang_code="en"):
-        """Transcribe using Whisper with scipy audio loading — no ffmpeg required."""
-        import numpy as np
+    def _load_audio_float32(wav_path):
+        """Load a WAV file and return a mono float32 numpy array at 16 kHz."""
         import scipy.io.wavfile as wavfile
-
-        wmodel = get_whisper("base")
-
-        # Load WAV with scipy (avoids ffmpeg dependency)
         sample_rate, audio = wavfile.read(wav_path)
-
-        # Convert to float32 in [-1, 1]
         if audio.dtype == np.int16:
             audio = audio.astype(np.float32) / 32768.0
         elif audio.dtype == np.int32:
             audio = audio.astype(np.float32) / 2147483648.0
-        elif audio.dtype == np.float32:
-            pass  # already correct
-        else:
+        elif audio.dtype != np.float32:
             audio = audio.astype(np.float32)
-
-        # Make mono if stereo
         if audio.ndim > 1:
             audio = audio.mean(axis=1)
-
-        # Resample to 16000 Hz if needed
         if sample_rate != 16000:
             import scipy.signal as signal
             num_samples = int(len(audio) * 16000 / sample_rate)
             audio = signal.resample(audio, num_samples)
+        return audio
 
-        res = wmodel.transcribe(audio, language=lang_code, fp16=False)
+    @staticmethod
+    def detect_language(wav_path) -> str:
+        """Use Whisper to detect the spoken language. Returns an ISO-639-1 code, e.g. 'hi', 'en', 'ta'."""
+        wmodel = get_whisper("base")
+        audio = AIService._load_audio_float32(wav_path)
+        # Whisper.detect_language needs a padded/trimmed 30-second mel
+        audio_padded = whisper.pad_or_trim(audio)
+        mel = whisper.log_mel_spectrogram(audio_padded).to(wmodel.device)
+        _, probs = wmodel.detect_language(mel)
+        detected = max(probs, key=probs.get)
+        confidence = probs[detected]
+        print(f"[Language detection] {detected} ({confidence:.2%})")
+        return detected
+
+    @staticmethod
+    def whisper_stt(wav_path, lang_code=None):
+        """Transcribe using Whisper with scipy audio loading — no ffmpeg required.
+        lang_code=None means Whisper auto-detects the language."""
+        wmodel = get_whisper("base")
+        audio = AIService._load_audio_float32(wav_path)
+        kwargs = {"fp16": False}
+        if lang_code:
+            kwargs["language"] = lang_code
+        res = wmodel.transcribe(audio, **kwargs)
         return res["text"].strip()
+
+    @staticmethod
+    def generate_tts(text: str, lang_key: str) -> tuple[bytes, str]:
+        """Generate TTS audio and return the audio bytes and content type."""
+        if lang_key == "English":
+            from gtts import gTTS
+            from io import BytesIO
+            tts = gTTS(text=text, lang="en")
+            fp = BytesIO()
+            tts.write_to_fp(fp)
+            return fp.getvalue(), "audio/mpeg"
+
+        api_key = os.environ.get("SARVAM_API_KEY", "")
+        if not api_key:
+            raise ValueError("SARVAM_API_KEY not found")
+
+        sarvam_lang_codes = {
+            "Hindi (हिन्दी)":   "hi-IN",
+            "Kannada (ಕನ್ನಡ)": "kn-IN",
+            "Marathi (मराठी)":  "mr-IN",
+            "Bengali (বাংলা)":  "bn-IN",
+            "Malayalam (മലയാളം)": "ml-IN",
+            "Tamil (தமிழ்)": "ta-IN",
+            "Konkani (कोंकणी)": "mr-IN", # fallback for Konkani
+        }
+        lang_code = sarvam_lang_codes.get(lang_key, "hi-IN")
+        
+        # Use the exact payload that works in the desktop app
+        response = requests.post(AIService.SARVAM_TTS_URL,
+            headers={"api-subscription-key": api_key, "Content-Type": "application/json"},
+            json={"target_language_code": lang_code, "text": text, "speaker": "meera"},
+            timeout=20)
+        
+        response.raise_for_status()
+        import base64
+        js = response.json()
+        audio_b64 = js.get("audio_output", js.get("audios", [""])[0])
+        audio_data = base64.b64decode(audio_b64)
+        return audio_data, "audio/wav"
 
 # ─────────────────────────────────────────────
 #  Report Generator
 # ─────────────────────────────────────────────
+
+# Absolute path to the bundled Noto fonts directory
+_FONTS_DIR = Path(__file__).parent / "fonts"
+
+# Map of script-range start codepoints → font file
+# We register one font per script family.
+_SCRIPT_FONTS = [
+    # (unicode_start, unicode_end, font_file, fpdf_family_name)
+    (0x0900, 0x097F, "NotoSansDevanagari-Regular.ttf", "NotoDevanagari"),  # Devanagari (Hindi, Marathi, Konkani)
+    (0x0980, 0x09FF, "NotoSansBengali-Regular.ttf",    "NotoBengali"),     # Bengali
+    (0x0B80, 0x0BFF, "NotoSansTamil-Regular.ttf",      "NotoTamil"),       # Tamil
+    (0x0C00, 0x0C7F, "NotoSansKannada-Regular.ttf",    "NotoKannada"),     # Kannada
+    (0x0D00, 0x0D7F, "NotoSansMalayalam-Regular.ttf",  "NotoMalayalam"),   # Malayalam
+]
+
+
+def _build_unicode_pdf(title_line1: str, title_line2: str, transcripts: list) -> FPDF:
+    """Build an FPDF document that correctly renders Indian-script text.
+
+    Strategy: split each text field into segments by Unicode block, then
+    render each segment with the appropriate Noto script font.
+    """
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    # Register all script fonts once
+    registered = set()
+    for _, _, fname, family in _SCRIPT_FONTS:
+        fpath = _FONTS_DIR / fname
+        if family not in registered and fpath.exists():
+            pdf.add_font(family, "", str(fpath))
+            registered.add(family)
+
+    # Also register the Latin Noto font (for headers and ASCII)
+    latin_path = _FONTS_DIR / "NotoSans-Regular.ttf"
+    bold_path   = _FONTS_DIR / "NotoSans-Bold.ttf"
+    if latin_path.exists():
+        pdf.add_font("NotoLatin", "",  str(latin_path))
+    if bold_path.exists():
+        pdf.add_font("NotoLatin", "B", str(bold_path))
+
+    def use(style="", size=11):
+        try:
+            pdf.set_font("NotoLatin", style, size)
+        except Exception:
+            pdf.set_font("Helvetica", style, size)
+
+    # Title
+    use("B", 16)
+    pdf.cell(0, 10, title_line1, new_x="LMARGIN", new_y="NEXT", align="C")
+    use("", 10)
+    pdf.cell(0, 8, title_line2, new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.ln(6)
+
+    def _family_for_char(ch: str) -> str:
+        cp = ord(ch)
+        for start, end, _, family in _SCRIPT_FONTS:
+            if start <= cp <= end:
+                return family
+        return "NotoLatin"
+
+    def _render_text(text: str, font_size=10):
+        """Render a string, switching fonts per Unicode block segment."""
+        if not text:
+            return
+        # Split into segments of the same font family
+        segments = []
+        cur_family = _family_for_char(text[0])
+        cur_chunk = text[0]
+        for ch in text[1:]:
+            fam = _family_for_char(ch)
+            if fam == cur_family:
+                cur_chunk += ch
+            else:
+                segments.append((cur_family, cur_chunk))
+                cur_family, cur_chunk = fam, ch
+        segments.append((cur_family, cur_chunk))
+
+        # Write segments inline, wrapping manually with multi_cell for each chunk
+        # For simplicity, concatenate segments into one write using the dominant font
+        # (fpdf2 doesn't support mid-cell font switch easily without spans)
+        # Best effort: use the family of the first non-Latin chunk, fall back to Latin
+        dominant = next((f for f, _ in segments if f != "NotoLatin"), "NotoLatin")
+        try:
+            pdf.set_font(dominant, "", font_size)
+        except Exception:
+            pdf.set_font("NotoLatin", "", font_size)
+        try:
+            pdf.multi_cell(0, 6, text)
+        except Exception as exc:
+            print(f"[PDF render error, skipping line]: {exc}")
+
+    for entry in transcripts:
+        # Entry header
+        use("B", 10)
+        ts = entry.get("timestamp", "")
+        role = entry.get("role", "").upper()
+        pdf.cell(0, 6, f"[{ts}] {role}:", new_x="LMARGIN", new_y="NEXT")
+
+        use("", 10)
+        pdf.cell(15, 6, "Orig:", new_x="END", new_y="LAST")
+        _render_text(entry.get("original", ""), font_size=10)
+
+        use("", 10)
+        pdf.cell(15, 6, "Tran:", new_x="END", new_y="LAST")
+        _render_text(entry.get("translated", ""), font_size=10)
+
+        pdf.ln(3)
+
+    return pdf
+
+
 class ReportGenerator:
+
     @staticmethod
-    def generate_pdf(patient_id, patient_name):
+    def generate_pdf(patient_id, patient_name, transcripts=None):
+        """Generate a consultation PDF.
+
+        If *transcripts* is provided (list of dicts), it is used directly —
+        this lets the frontend pass the live in-memory session so the PDF
+        always reflects what is on screen, not just what is saved to disk.
+        """
         p_dir = PATIENTS_DIR / patient_id
         log_path = p_dir / "transcripts.json"
         pdf_path = p_dir / "consultation_history.pdf"
+
+        if transcripts is None:
+            if not log_path.exists():
+                return None
+            with open(log_path, "r", encoding="utf-8") as f:
+                transcripts = json.load(f)
+
+        title1 = f"Medical Consultation History - {patient_name}"
+        title2 = f"Patient ID: {patient_id}  |  Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        pdf = _build_unicode_pdf(title1, title2, transcripts)
+        pdf.output(str(pdf_path))
+        return pdf_path
+
+    @staticmethod
+    def archive_chat(patient_id, patient_name):
+        p_dir = PATIENTS_DIR / patient_id
+        log_path = p_dir / "transcripts.json"
 
         if not log_path.exists():
             return None
@@ -219,21 +567,42 @@ class ReportGenerator:
         with open(log_path, "r", encoding="utf-8") as f:
             transcripts = json.load(f)
 
-        pdf = FPDF()
-        pdf.add_page()
-        pdf.set_font("Arial", "B", 16)
-        pdf.cell(0, 10, f"Medical Consultation History - {patient_name}", ln=True, align="C")
-        pdf.set_font("Arial", "", 10)
-        pdf.cell(0, 8, f"Patient ID: {patient_id}", ln=True, align="C")
-        pdf.ln(6)
+        if not transcripts:
+            return None
 
-        for entry in transcripts:
-            pdf.set_font("Arial", "B", 10)
-            pdf.cell(0, 5, f"[{entry['timestamp']}] {entry['role'].upper()}:", ln=True)
-            pdf.set_font("Arial", "", 10)
-            pdf.multi_cell(0, 5, f"Original: {entry['original']}")
-            pdf.multi_cell(0, 5, f"Translated: {entry['translated']}")
-            pdf.ln(3)
+        history_dir = p_dir / "history"
+        history_dir.mkdir(exist_ok=True)
 
+        timestamp = int(datetime.now().timestamp())
+        pdf_path = history_dir / f"chat_history_{timestamp}.pdf"
+
+        title1 = f"Medical Consultation Archive - {patient_name}"
+        title2 = f"Patient ID: {patient_id}  |  Archived: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        pdf = _build_unicode_pdf(title1, title2, transcripts)
         pdf.output(str(pdf_path))
+
+        # Clear transcripts after archiving
+        with open(log_path, "w", encoding="utf-8") as f:
+            json.dump([], f, ensure_ascii=False, indent=2)
+
         return pdf_path
+
+    @staticmethod
+    def list_archives(patient_id):
+        """Return a list of {filename, timestamp, size_kb} for all archives."""
+        history_dir = PATIENTS_DIR / patient_id / "history"
+        if not history_dir.exists():
+            return []
+        archives = []
+        for p in sorted(history_dir.glob("chat_history_*.pdf"), reverse=True):
+            ts_str = p.stem.replace("chat_history_", "")
+            try:
+                dt = datetime.fromtimestamp(int(ts_str)).strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                dt = ts_str
+            archives.append({
+                "filename": p.name,
+                "archived_at": dt,
+                "size_kb": round(p.stat().st_size / 1024, 1)
+            })
+        return archives
