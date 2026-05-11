@@ -284,6 +284,9 @@ function Consultation({ patient, onEnd }) {
   const [showArchives, setShowArchives]   = useState(false);
   const [archives, setArchives]           = useState([]);
   const [archivesLoading, setArchivesLoading] = useState(false);
+  const [showRecordings, setShowRecordings] = useState(false);
+  const [recordings, setRecordings] = useState([]);
+  const [recordingsLoading, setRecordingsLoading] = useState(false);
   const [autoDetect, setAutoDetect]       = useState(true);
 
   // Live / VAD state
@@ -298,6 +301,7 @@ function Consultation({ patient, onEnd }) {
   const mediaRecorder   = useRef(null);
   const audioChunks     = useRef([]);
   const chatEndRef      = useRef(null);
+  const translatedPlaybackRef = useRef(null);
   
   // Live VAD refs
   const liveCtxRef = useRef(null);
@@ -330,6 +334,36 @@ function Consultation({ patient, onEnd }) {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
+  const playTranslatedAudio = useCallback((filename) => {
+    if (!filename) return;
+    try {
+      if (translatedPlaybackRef.current) {
+        translatedPlaybackRef.current.pause();
+        translatedPlaybackRef.current = null;
+      }
+      const audio = new Audio(`${API_BASE}/patients/${patient.id}/recordings/${filename}`);
+      translatedPlaybackRef.current = audio;
+      audio.play().catch(() => {});
+    } catch {
+      // Ignore autoplay failures and keep transcript flow uninterrupted.
+    }
+  }, [patient.id]);
+
+  const ensureTranslatedClip = useCallback(async (entry) => {
+    if (entry.translated_audio_filename) return entry.translated_audio_filename;
+    try {
+      const res = await axios.post(`${API_BASE}/patients/${patient.id}/tts_clip`, {
+        text: entry.translated,
+        role: entry.role,
+        lang_key: langKeyRef.current,
+        doctor_lang_key: doctorLangRef.current,
+      });
+      return res.data?.translated_audio_filename || null;
+    } catch {
+      return null;
+    }
+  }, [patient.id]);
+
   // Cleanup live session on unmount
   useEffect(() => () => stopLive(), []);
 
@@ -351,9 +385,17 @@ function Consultation({ patient, onEnd }) {
       fd.append('patient_id', pid);
       const res = await axios.post(`${API_BASE}/stt`, fd);
       const resolvedRole = res.data.role || role;
-      const entry = { role: resolvedRole, original: res.data.original, translated: res.data.translated };
+      const entry = {
+        role: resolvedRole,
+        original: res.data.original,
+        translated: res.data.translated,
+        audio_filename: res.data.audio_filename || null,
+        translated_audio_filename: res.data.translated_audio_filename || null,
+      };
+      entry.translated_audio_filename = await ensureTranslatedClip(entry);
       await axios.post(`${API_BASE}/patients/${pid}/append_transcript`, entry);
       setMessages(prev => [...prev, { ...entry, timestamp: new Date().toLocaleTimeString() }]);
+      playTranslatedAudio(entry.translated_audio_filename);
       setStatus(`Done ✓ — ${resolvedRole.charAt(0).toUpperCase() + resolvedRole.slice(1)} detected`);
     } catch (err) {
       setStatus(`Error: ${err.response?.data?.detail || err.message}`);
@@ -472,9 +514,17 @@ function Consultation({ patient, onEnd }) {
           fd.append('patient_id', patient.id);
           setStatus('Transcribing & translating…');
           const res   = await axios.post(`${API_BASE}/stt`, fd);
-          const entry = { role, original: res.data.original, translated: res.data.translated };
+          const entry = {
+            role,
+            original: res.data.original,
+            translated: res.data.translated,
+            audio_filename: res.data.audio_filename || null,
+            translated_audio_filename: res.data.translated_audio_filename || null,
+          };
+          entry.translated_audio_filename = await ensureTranslatedClip(entry);
           await axios.post(`${API_BASE}/patients/${patient.id}/append_transcript`, entry);
           setMessages(prev => [...prev, { ...entry, timestamp: new Date().toLocaleTimeString() }]);
+          playTranslatedAudio(entry.translated_audio_filename);
           setStatus('Done ✓');
         } catch (err) {
           setStatus(`Error: ${err.response?.data?.detail || err.message}`);
@@ -566,6 +616,19 @@ function Consultation({ patient, onEnd }) {
   const downloadArchive = (filename) => {
     window.open(`${API_BASE}/patients/${patient.id}/archives/${filename}`, '_blank');
   };
+
+  const openRecordings = async () => {
+    setShowRecordings(true);
+    setRecordingsLoading(true);
+    try {
+      const res = await axios.get(`${API_BASE}/patients/${patient.id}/recordings`);
+      setRecordings(res.data);
+    } catch {
+      setRecordings([]);
+    } finally {
+      setRecordingsLoading(false);
+    }
+  };
   
   const clearChat = async () => {
     if (!window.confirm("Are you sure you want to clear this chat? It will be archived securely as a PDF.")) return;
@@ -589,6 +652,53 @@ function Consultation({ patient, onEnd }) {
 
   return (
     <div className="consultation-page animate-in">
+      {/* Recordings Modal */}
+      {showRecordings && (
+        <div className="modal-overlay" onClick={() => setShowRecordings(false)}>
+          <div className="modal-box" onClick={e => e.stopPropagation()}>
+            <div className="modal-header">
+              <Mic size={18} />
+              <span>Past Recordings</span>
+              <button className="modal-close" onClick={() => setShowRecordings(false)}><X size={18} /></button>
+            </div>
+            <div className="modal-body">
+              {recordingsLoading ? (
+                <p className="empty-state">Loading…</p>
+              ) : recordings.length === 0 ? (
+                <p className="empty-state">No recordings found for this patient.</p>
+              ) : (
+                <div className="archive-list">
+                  {recordings.map((r, i) => (
+                    <div key={i} className="archive-row">
+                      <div className="archive-info">
+                        <Mic size={15} className="accent-icon" />
+                        <div style={{ minWidth: 0 }}>
+                          <div className="archive-date" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {r.kind === 'utterance'
+                              ? `Utterance${r.role ? ` (${r.role})` : ''}`
+                              : r.kind === 'translated_tts'
+                                ? `Translated audio${r.role ? ` (${r.role})` : ''}`
+                              : r.kind === 'session'
+                                ? 'Full session'
+                                : 'Recording'}
+                          </div>
+                          <div className="archive-size">
+                            {r.size_kb != null ? `${r.size_kb} KB` : ''} {r.filename ? `• ${r.filename}` : ''}
+                          </div>
+                        </div>
+                      </div>
+                      <div style={{ flex: 1, minWidth: 220, paddingLeft: 10 }}>
+                        <audio controls preload="none" style={{ width: '100%' }} src={`${API_BASE}${r.url}`} />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Archives Modal */}
       {showArchives && (
         <div className="modal-overlay" onClick={() => setShowArchives(false)}>
@@ -675,6 +785,28 @@ function Consultation({ patient, onEnd }) {
                 </div>
                 <p className="msg-original"><span className="msg-label">Original:</span> {m.original}</p>
                 <p className="msg-translated"><span className="msg-label">Translated:</span> {m.translated}</p>
+                {m.audio_filename && (
+                  <>
+                    <p className="msg-label" style={{ marginTop: '8px' }}>Original utterance clip</p>
+                    <audio
+                      controls
+                      preload="none"
+                      style={{ width: '100%', marginTop: '6px' }}
+                      src={`${API_BASE}/patients/${patient.id}/recordings/${m.audio_filename}`}
+                    />
+                  </>
+                )}
+                {m.translated_audio_filename && (
+                  <>
+                    <p className="msg-label" style={{ marginTop: '8px' }}>Translated AI voice clip</p>
+                    <audio
+                      controls
+                      preload="none"
+                      style={{ width: '100%', marginTop: '6px' }}
+                      src={`${API_BASE}/patients/${patient.id}/recordings/${m.translated_audio_filename}`}
+                    />
+                  </>
+                )}
               </div>
             ))}
             <div ref={chatEndRef} />
@@ -796,6 +928,9 @@ function Consultation({ patient, onEnd }) {
             </button>
             <button className="btn-outline" onClick={openArchives} style={{ borderColor: '#818cf8', color: '#818cf8' }}>
               <Archive size={16} /> View Past Archives
+            </button>
+            <button className="btn-outline" onClick={openRecordings} style={{ borderColor: '#38bdf8', color: '#38bdf8' }}>
+              <Mic size={16} /> View Past Recordings
             </button>
             <button className="btn-outline" onClick={clearChat} disabled={anyBusy} style={{ borderColor: '#f59e0b', color: '#f59e0b' }}>
               <Square size={16} /> Clear Chat & Archive

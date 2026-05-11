@@ -376,19 +376,71 @@ Return ONLY the corrected transcript text with no extra commentary."""
         return res["text"].strip()
 
     @staticmethod
+    def is_language_consistent(text: str, lang_key: str) -> bool:
+        """
+        Best-effort check that transcript script roughly matches selected language.
+        Helps catch obvious wrong-language STT outputs (e.g., Malayalam for Hindi).
+        """
+        if not text:
+            return False
+        if lang_key == "English":
+            letters = [ch for ch in text if ch.isalpha()]
+            if not letters:
+                return True
+            latin = sum(1 for ch in letters if ("a" <= ch.lower() <= "z"))
+            return latin / len(letters) >= 0.6
+
+        script_ranges = {
+            # Devanagari family
+            "Hindi (हिन्दी)": (0x0900, 0x097F),
+            "Marathi (मराठी)": (0x0900, 0x097F),
+            "Konkani (कोंकणी)": (0x0900, 0x097F),
+            # Other Indic scripts
+            "Bengali (বাংলা)": (0x0980, 0x09FF),
+            "Tamil (தமிழ்)": (0x0B80, 0x0BFF),
+            "Kannada (ಕನ್ನಡ)": (0x0C80, 0x0CFF),
+            "Malayalam (മലയാളം)": (0x0D00, 0x0D7F),
+        }
+        if lang_key not in script_ranges:
+            return True
+
+        start, end = script_ranges[lang_key]
+        letters = [ch for ch in text if ch.isalpha()]
+        if not letters:
+            return True
+        in_script = sum(1 for ch in letters if start <= ord(ch) <= end)
+        # Keep threshold modest for mixed-script / short transcripts.
+        return (in_script / len(letters)) >= 0.35
+
+    @staticmethod
     def generate_tts(text: str, lang_key: str) -> tuple[bytes, str]:
         """Generate TTS audio and return the audio bytes and content type."""
         if lang_key == "English":
-            from gtts import gTTS
-            from io import BytesIO
-            tts = gTTS(text=text, lang="en")
-            fp = BytesIO()
-            tts.write_to_fp(fp)
-            return fp.getvalue(), "audio/mpeg"
-
-        api_key = os.environ.get("SARVAM_API_KEY", "")
-        if not api_key:
-            raise ValueError("SARVAM_API_KEY not found")
+            # Prefer gTTS for English, but fall back to Sarvam if gTTS fails.
+            try:
+                from gtts import gTTS
+                from io import BytesIO
+                tts = gTTS(text=text, lang="en")
+                fp = BytesIO()
+                tts.write_to_fp(fp)
+                return fp.getvalue(), "audio/mpeg"
+            except Exception as gtts_err:
+                print(f"[generate_tts] gTTS failed for English, trying Sarvam fallback: {gtts_err}")
+                api_key = os.environ.get("SARVAM_API_KEY", "")
+                if not api_key:
+                    raise
+                response = requests.post(
+                    AIService.SARVAM_TTS_URL,
+                    headers={"api-subscription-key": api_key, "Content-Type": "application/json"},
+                    json={"target_language_code": "en-IN", "text": text, "speaker": "meera"},
+                    timeout=20
+                )
+                response.raise_for_status()
+                import base64
+                js = response.json()
+                audio_b64 = js.get("audio_output", js.get("audios", [""])[0])
+                audio_data = base64.b64decode(audio_b64)
+                return audio_data, "audio/wav"
 
         sarvam_lang_codes = {
             "Hindi (हिन्दी)":   "hi-IN",
@@ -399,20 +451,43 @@ Return ONLY the corrected transcript text with no extra commentary."""
             "Tamil (தமிழ்)": "ta-IN",
             "Konkani (कोंकणी)": "mr-IN", # fallback for Konkani
         }
-        lang_code = sarvam_lang_codes.get(lang_key, "hi-IN")
-        
-        # Use the exact payload that works in the desktop app
-        response = requests.post(AIService.SARVAM_TTS_URL,
-            headers={"api-subscription-key": api_key, "Content-Type": "application/json"},
-            json={"target_language_code": lang_code, "text": text, "speaker": "meera"},
-            timeout=20)
-        
-        response.raise_for_status()
-        import base64
-        js = response.json()
-        audio_b64 = js.get("audio_output", js.get("audios", [""])[0])
-        audio_data = base64.b64decode(audio_b64)
-        return audio_data, "audio/wav"
+        gtts_lang_codes = {
+            "Hindi (हिन्दी)": "hi",
+            "Kannada (ಕನ್ನಡ)": "kn",
+            "Marathi (मराठी)": "mr",
+            "Bengali (বাংলা)": "bn",
+            "Malayalam (മലയാളം)": "ml",
+            "Tamil (தமிழ்)": "ta",
+            "Konkani (कोंकणी)": "mr",
+        }
+
+        # Prefer Sarvam for Indian language quality, then fall back to gTTS.
+        api_key = os.environ.get("SARVAM_API_KEY", "")
+        if api_key:
+            try:
+                lang_code = sarvam_lang_codes.get(lang_key, "hi-IN")
+                response = requests.post(
+                    AIService.SARVAM_TTS_URL,
+                    headers={"api-subscription-key": api_key, "Content-Type": "application/json"},
+                    json={"target_language_code": lang_code, "text": text, "speaker": "meera"},
+                    timeout=20
+                )
+                response.raise_for_status()
+                import base64
+                js = response.json()
+                audio_b64 = js.get("audio_output", js.get("audios", [""])[0])
+                audio_data = base64.b64decode(audio_b64)
+                return audio_data, "audio/wav"
+            except Exception as sarvam_err:
+                print(f"[generate_tts] Sarvam TTS failed for {lang_key}, falling back to gTTS: {sarvam_err}")
+
+        from gtts import gTTS
+        from io import BytesIO
+        gtts_lang = gtts_lang_codes.get(lang_key, "hi")
+        tts = gTTS(text=text, lang=gtts_lang)
+        fp = BytesIO()
+        tts.write_to_fp(fp)
+        return fp.getvalue(), "audio/mpeg"
 
 # ─────────────────────────────────────────────
 #  Report Generator
