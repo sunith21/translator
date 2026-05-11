@@ -80,14 +80,26 @@ class PatientManager:
                     id TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_visit TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    last_visit TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    phone_number TEXT,
+                    email TEXT
                 )
             """)
+            try:
+                conn.execute("ALTER TABLE patients ADD COLUMN phone_number TEXT")
+            except sqlite3.OperationalError: pass
+            try:
+                conn.execute("ALTER TABLE patients ADD COLUMN email TEXT")
+            except sqlite3.OperationalError: pass
 
-    def add_patient(self, patient_id, name):
+    def add_patient(self, patient_id, name, phone_number=None, email=None):
         with sqlite3.connect(self.db_path) as conn:
-            conn.execute("INSERT OR REPLACE INTO patients (id, name, last_visit) VALUES (?, ?, ?)",
-                         (patient_id, name, datetime.now()))
+            existing = self.get_patient(patient_id)
+            if existing:
+                if phone_number is None: phone_number = existing.get("phone_number")
+                if email is None: email = existing.get("email")
+            conn.execute("INSERT OR REPLACE INTO patients (id, name, last_visit, phone_number, email) VALUES (?, ?, ?, ?, ?)",
+                         (patient_id, name, datetime.now(), phone_number, email))
         
         # Create directory structure
         p_dir = PATIENTS_DIR / patient_id
@@ -102,9 +114,9 @@ class PatientManager:
 
     def get_patient(self, patient_id):
         with sqlite3.connect(self.db_path) as conn:
-            res = conn.execute("SELECT id, name, last_visit FROM patients WHERE id = ?", (patient_id,)).fetchone()
+            res = conn.execute("SELECT id, name, last_visit, phone_number, email FROM patients WHERE id = ?", (patient_id,)).fetchone()
             if res:
-                return {"id": res[0], "name": res[1], "last_visit": res[2]}
+                return {"id": res[0], "name": res[1], "last_visit": res[2], "phone_number": res[3], "email": res[4]}
         return None
 
     def search_patients(self, query):
@@ -404,6 +416,13 @@ class HospitalApp(ctk.CTk):
         self.entry_id = ctk.CTkEntry(form, placeholder_text="Unique Patient ID", width=300)
         self.entry_id.pack(pady=10)
         
+        self.entry_phone = ctk.CTkEntry(form, placeholder_text="Phone Number (+91...)", width=300)
+        self.entry_phone.pack(pady=10)
+        self.entry_phone.insert(0, "+91")
+
+        self.entry_email = ctk.CTkEntry(form, placeholder_text="Email Address (Optional)", width=300)
+        self.entry_email.pack(pady=10)
+        
         ctk.CTkButton(form, text="Start Session", command=self.handle_new_session, fg_color=ACCENT).pack(pady=20)
 
     def show_search(self):
@@ -438,10 +457,17 @@ class HospitalApp(ctk.CTk):
             btn.pack(fill="x", pady=2)
 
     def handle_new_session(self):
-        name = self.entry_name.get()
-        pid = self.entry_id.get()
+        name = self.entry_name.get().strip()
+        pid = self.entry_id.get().strip()
+        phone = self.entry_phone.get().strip()
+        email = self.entry_email.get().strip()
+        if phone == "+91":
+            phone = ""
+        elif phone and not phone.startswith("+"):
+            phone = "+91" + phone.lstrip("0")
+
         if name and pid:
-            self.db.add_patient(pid, name)
+            self.db.add_patient(pid, name, phone, email)
             self.load_patient(pid)
 
     def load_patient(self, pid):
@@ -465,6 +491,10 @@ class HospitalApp(ctk.CTk):
         hdr.pack(fill="x", pady=(0, 10))
         ctk.CTkLabel(hdr, text=f"Patient: {self.current_patient['name']}", font=("Segoe UI", 16, "bold")).pack(side="left", padx=20, pady=10)
         ctk.CTkLabel(hdr, text=f"ID: {self.current_patient['id']}", text_color=SUBTEXT_COLOR).pack(side="left", padx=10, pady=10)
+        phone_txt = self.current_patient.get('phone_number') or 'N/A'
+        email_txt = self.current_patient.get('email') or 'N/A'
+        ctk.CTkLabel(hdr, text=f"Phone: {phone_txt}", text_color=SUBTEXT_COLOR).pack(side="left", padx=10, pady=10)
+        ctk.CTkLabel(hdr, text=f"Email: {email_txt}", text_color=SUBTEXT_COLOR).pack(side="left", padx=10, pady=10)
         
         # Main area: Split into Chat and History
         split = ctk.CTkFrame(view, fg_color="transparent")
@@ -493,6 +523,9 @@ class HospitalApp(ctk.CTk):
         ctk.CTkLabel(hist, text="Session Info", font=("Segoe UI", 14, "bold")).pack(pady=10)
         ctk.CTkButton(hist, text="Open Patient PDF", fg_color="transparent", border_width=1, command=self.open_pdf).pack(pady=5, padx=20, fill="x")
         ctk.CTkButton(hist, text="View Past Recordings", fg_color="transparent", border_width=1, command=self._view_recordings).pack(pady=5, padx=20, fill="x")
+        ctk.CTkButton(hist, text="Send via WhatsApp (API)", fg_color="#25D366", text_color="white", command=self.send_pdf_whatsapp).pack(pady=5, padx=20, fill="x")
+        ctk.CTkButton(hist, text="Share via WhatsApp (Free)", fg_color="#075e54", text_color="white", command=self.send_pdf_whatsapp_free).pack(pady=5, padx=20, fill="x")
+        ctk.CTkButton(hist, text="Send via Email", fg_color="#ea4335", text_color="white", command=self.send_pdf_email).pack(pady=5, padx=20, fill="x")
         ctk.CTkButton(hist, text="End Session", fg_color="#611", command=self.end_session).pack(side="bottom", pady=20, padx=20, fill="x")
 
     # ─── Consultation Logic ───
@@ -645,6 +678,140 @@ class HospitalApp(ctk.CTk):
             ctk.CTkLabel(f_frame, text=f.name, font=("Segoe UI", 11)).pack(side="left")
             ctk.CTkButton(f_frame, text="▶ Play", width=50, height=24, command=lambda path=str(f): threading.Thread(target=AIService._play_audio, args=(path,), daemon=True).start()).pack(side="right")
             ctk.CTkButton(f_frame, text="📂 Open", width=50, height=24, command=lambda path=str(f): os.startfile(os.path.dirname(path))).pack(side="right", padx=5)
+
+    def send_pdf_whatsapp(self):
+        phone = self.current_patient.get("phone_number")
+        if not phone or phone == "N/A":
+            messagebox.showerror("Error", "No phone number available for this patient.")
+            return
+
+        pdf_path = PATIENTS_DIR / self.current_patient["id"] / "consultation_history.pdf"
+        if not pdf_path.exists():
+            ReportGenerator.update_pdf(self.current_patient["id"], self.current_patient["name"])
+            if not pdf_path.exists():
+                messagebox.showerror("Error", "No consultation data to send.")
+                return
+
+        def send_task():
+            import requests
+            try:
+                url = "https://tmpfiles.org/api/v1/upload"
+                with open(pdf_path, "rb") as f:
+                    response = requests.post(url, files={"file": f})
+                if response.status_code == 200:
+                    data = response.json()
+                    file_url = data["data"]["url"]
+                    direct_url = file_url.replace("tmpfiles.org/", "tmpfiles.org/dl/")
+                else:
+                    self.after(0, lambda: messagebox.showerror("Upload Error", "Failed to upload PDF for sending."))
+                    return
+            except Exception as e:
+                self.after(0, lambda e=e: messagebox.showerror("Upload Error", f"Exception during upload: {e}"))
+                return
+            
+            from twilio.rest import Client
+            import os
+            sid = os.environ.get("TWILIO_ACCOUNT_SID")
+            token = os.environ.get("TWILIO_AUTH_TOKEN")
+            from_num = os.environ.get("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
+
+            if not sid or not token:
+                self.after(0, lambda: messagebox.showerror("Twilio Error", "Twilio credentials not configured in .env"))
+                return
+
+            try:
+                client = Client(sid, token)
+                message = client.messages.create(
+                    from_=from_num,
+                    body=f"Hello {self.current_patient['name']}, here is your medical consultation report.",
+                    to=f"whatsapp:{phone}",
+                    media_url=[direct_url]
+                )
+                self.after(0, lambda: messagebox.showinfo("Success", f"WhatsApp message sent! SID: {message.sid}"))
+            except Exception as e:
+                self.after(0, lambda e=e: messagebox.showerror("Twilio Error", f"Failed to send: {e}"))
+
+        threading.Thread(target=send_task, daemon=True).start()
+
+    def send_pdf_whatsapp_free(self):
+        """Free alternative: Opens a WhatsApp web link with the PDF hosted link."""
+        phone = self.current_patient.get("phone_number")
+        if not phone or phone == "N/A":
+            messagebox.showerror("Error", "No phone number available.")
+            return
+        
+        pdf_path = PATIENTS_DIR / self.current_patient["id"] / "consultation_history.pdf"
+        if not pdf_path.exists():
+            ReportGenerator.update_pdf(self.current_patient["id"], self.current_patient["name"])
+        
+        def upload_and_open():
+            import requests, webbrowser, urllib.parse
+            try:
+                url = "https://tmpfiles.org/api/v1/upload"
+                with open(pdf_path, "rb") as f:
+                    response = requests.post(url, files={"file": f})
+                if response.status_code == 200:
+                    data = response.json()
+                    file_url = data["data"]["url"]
+                    direct_url = file_url.replace("tmpfiles.org/", "tmpfiles.org/dl/")
+                    msg = f"Hello {self.current_patient['name']}, here is your medical report: {direct_url}"
+                    encoded_msg = urllib.parse.quote(msg)
+                    clean_phone = phone.replace("+", "").replace(" ", "")
+                    wa_url = f"https://wa.me/{clean_phone}?text={encoded_msg}"
+                    webbrowser.open(wa_url)
+                else:
+                    self.after(0, lambda: messagebox.showerror("Error", "Failed to upload PDF for sharing."))
+            except Exception as e:
+                self.after(0, lambda e=e: messagebox.showerror("Error", f"Failed to share: {e}"))
+
+        threading.Thread(target=upload_and_open, daemon=True).start()
+
+    def send_pdf_email(self):
+        """Free alternative: Sends PDF via Email using SMTP configuration."""
+        email = self.current_patient.get("email")
+        if not email or "@" not in email:
+            messagebox.showerror("Error", "No valid email address available.")
+            return
+
+        pdf_path = PATIENTS_DIR / self.current_patient["id"] / "consultation_history.pdf"
+        if not pdf_path.exists():
+            ReportGenerator.update_pdf(self.current_patient["id"], self.current_patient["name"])
+
+        def email_task():
+            import smtplib, os
+            from email.message import EmailMessage
+            
+            host = os.environ.get("SMTP_HOST")
+            port = int(os.environ.get("SMTP_PORT", 587))
+            user = os.environ.get("SMTP_USER")
+            password = os.environ.get("SMTP_PASS")
+            sender = os.environ.get("SMTP_FROM", f"Clinic AI <{user}>")
+
+            if not user or not password:
+                self.after(0, lambda: messagebox.showerror("Email Error", "SMTP credentials not configured in .env"))
+                return
+
+            try:
+                msg = EmailMessage()
+                msg['Subject'] = f"Medical Consultation Report - {self.current_patient['name']}"
+                msg['From'] = sender
+                msg['To'] = email
+                msg.set_content(f"Hello {self.current_patient['name']},\n\nPlease find attached your medical consultation report.\n\nRegards,\nClinic AI Team")
+
+                with open(pdf_path, 'rb') as f:
+                    file_data = f.read()
+                    msg.add_attachment(file_data, maintype='application', subtype='pdf', filename=f"{self.current_patient['name']}_report.pdf")
+
+                with smtplib.SMTP(host, port) as server:
+                    server.starttls()
+                    server.login(user, password)
+                    server.send_message(msg)
+                
+                self.after(0, lambda: messagebox.showinfo("Success", f"Report sent to {email} successfully!"))
+            except Exception as e:
+                self.after(0, lambda e=e: messagebox.showerror("Email Error", f"Failed to send email: {e}"))
+
+        threading.Thread(target=email_task, daemon=True).start()
 
 if __name__ == "__main__":
     app = HospitalApp()
