@@ -375,6 +375,45 @@ Return ONLY the corrected transcript text with no extra commentary."""
         res = wmodel.transcribe(audio, **kwargs)
         return res["text"].strip()
 
+    @staticmethod
+    def generate_tts(text: str, lang_key: str) -> tuple[bytes, str]:
+        """Generate TTS audio and return the audio bytes and content type."""
+        if lang_key == "English":
+            from gtts import gTTS
+            from io import BytesIO
+            tts = gTTS(text=text, lang="en")
+            fp = BytesIO()
+            tts.write_to_fp(fp)
+            return fp.getvalue(), "audio/mpeg"
+
+        api_key = os.environ.get("SARVAM_API_KEY", "")
+        if not api_key:
+            raise ValueError("SARVAM_API_KEY not found")
+
+        sarvam_lang_codes = {
+            "Hindi (हिन्दी)":   "hi-IN",
+            "Kannada (ಕನ್ನಡ)": "kn-IN",
+            "Marathi (मराठी)":  "mr-IN",
+            "Bengali (বাংলা)":  "bn-IN",
+            "Malayalam (മലയാളം)": "ml-IN",
+            "Tamil (தமிழ்)": "ta-IN",
+            "Konkani (कोंकणी)": "mr-IN", # fallback for Konkani
+        }
+        lang_code = sarvam_lang_codes.get(lang_key, "hi-IN")
+        
+        # Use the exact payload that works in the desktop app
+        response = requests.post(AIService.SARVAM_TTS_URL,
+            headers={"api-subscription-key": api_key, "Content-Type": "application/json"},
+            json={"target_language_code": lang_code, "text": text, "speaker": "meera"},
+            timeout=20)
+        
+        response.raise_for_status()
+        import base64
+        js = response.json()
+        audio_b64 = js.get("audio_output", js.get("audios", [""])[0])
+        audio_data = base64.b64decode(audio_b64)
+        return audio_data, "audio/wav"
+
 # ─────────────────────────────────────────────
 #  Report Generator
 # ─────────────────────────────────────────────
