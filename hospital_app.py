@@ -1,6 +1,4 @@
 import os
-import webbrowser
-import urllib.parse
 import json
 import threading
 import tempfile
@@ -82,23 +80,27 @@ class PatientManager:
                 CREATE TABLE IF NOT EXISTS patients (
                     id TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
-                    phone TEXT DEFAULT '',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_visit TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    last_visit TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    phone_number TEXT,
+                    email TEXT
                 )
             """)
-            # Migrate existing DBs that lack the phone column
             try:
-                conn.execute("ALTER TABLE patients ADD COLUMN phone TEXT DEFAULT ''")
-            except Exception:
-                pass  # Column already exists
+                conn.execute("ALTER TABLE patients ADD COLUMN phone_number TEXT")
+            except sqlite3.OperationalError: pass
+            try:
+                conn.execute("ALTER TABLE patients ADD COLUMN email TEXT")
+            except sqlite3.OperationalError: pass
 
-    def add_patient(self, patient_id, name, phone=""):
+    def add_patient(self, patient_id, name, phone_number=None, email=None):
         with sqlite3.connect(self.db_path) as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO patients (id, name, phone, last_visit) VALUES (?, ?, ?, ?)",
-                (patient_id, name, phone, datetime.now()),
-            )
+            existing = self.get_patient(patient_id)
+            if existing:
+                if phone_number is None: phone_number = existing.get("phone_number")
+                if email is None: email = existing.get("email")
+            conn.execute("INSERT OR REPLACE INTO patients (id, name, last_visit, phone_number, email) VALUES (?, ?, ?, ?, ?)",
+                         (patient_id, name, datetime.now(), phone_number, email))
         
         # Create directory structure
         p_dir = PATIENTS_DIR / patient_id
@@ -113,12 +115,9 @@ class PatientManager:
 
     def get_patient(self, patient_id):
         with sqlite3.connect(self.db_path) as conn:
-            res = conn.execute(
-                "SELECT id, name, phone, last_visit FROM patients WHERE id = ?",
-                (patient_id,),
-            ).fetchone()
+            res = conn.execute("SELECT id, name, last_visit, phone_number, email FROM patients WHERE id = ?", (patient_id,)).fetchone()
             if res:
-                return {"id": res[0], "name": res[1], "phone": res[2] or "", "last_visit": res[3]}
+                return {"id": res[0], "name": res[1], "last_visit": res[2], "phone_number": res[3], "email": res[4]}
         return None
 
     def search_patients(self, query):
@@ -423,25 +422,22 @@ class HospitalApp(ctk.CTk):
         self.clear_main()
         form = ctk.CTkFrame(self.main_container, fg_color=CARD_COLOR, corner_radius=10, width=400)
         form.place(relx=0.5, rely=0.4, anchor="center")
-
+        
         ctk.CTkLabel(form, text="New Consultation", font=("Segoe UI", 18, "bold"), text_color=ACCENT).pack(pady=20)
-
+        
         self.entry_name = ctk.CTkEntry(form, placeholder_text="Patient Name", width=300)
         self.entry_name.pack(pady=10)
-
+        
         self.entry_id = ctk.CTkEntry(form, placeholder_text="Unique Patient ID", width=300)
         self.entry_id.pack(pady=10)
-
-        self.entry_phone = ctk.CTkEntry(form, placeholder_text="WhatsApp Number (e.g. 919876543210)", width=300)
+        
+        self.entry_phone = ctk.CTkEntry(form, placeholder_text="Phone Number (+91...)", width=300)
         self.entry_phone.pack(pady=10)
+        self.entry_phone.insert(0, "+91")
 
-        ctk.CTkLabel(
-            form,
-            text="Include country code, no '+' or spaces",
-            text_color=SUBTEXT_COLOR,
-            font=("Segoe UI", 10),
-        ).pack()
-
+        self.entry_email = ctk.CTkEntry(form, placeholder_text="Email Address (Optional)", width=300)
+        self.entry_email.pack(pady=10)
+        
         ctk.CTkButton(form, text="Start Session", command=self.handle_new_session, fg_color=ACCENT).pack(pady=20)
 
     def show_search(self):
@@ -479,8 +475,14 @@ class HospitalApp(ctk.CTk):
         name = self.entry_name.get().strip()
         pid = self.entry_id.get().strip()
         phone = self.entry_phone.get().strip()
+        email = self.entry_email.get().strip()
+        if phone == "+91":
+            phone = ""
+        elif phone and not phone.startswith("+"):
+            phone = "+91" + phone.lstrip("0")
+
         if name and pid:
-            self.db.add_patient(pid, name, phone)
+            self.db.add_patient(pid, name, phone, email)
             self.load_patient(pid)
 
     def load_patient(self, pid):
@@ -504,6 +506,10 @@ class HospitalApp(ctk.CTk):
         hdr.pack(fill="x", pady=(0, 10))
         ctk.CTkLabel(hdr, text=f"Patient: {self.current_patient['name']}", font=("Segoe UI", 16, "bold")).pack(side="left", padx=20, pady=10)
         ctk.CTkLabel(hdr, text=f"ID: {self.current_patient['id']}", text_color=SUBTEXT_COLOR).pack(side="left", padx=10, pady=10)
+        phone_txt = self.current_patient.get('phone_number') or 'N/A'
+        email_txt = self.current_patient.get('email') or 'N/A'
+        ctk.CTkLabel(hdr, text=f"Phone: {phone_txt}", text_color=SUBTEXT_COLOR).pack(side="left", padx=10, pady=10)
+        ctk.CTkLabel(hdr, text=f"Email: {email_txt}", text_color=SUBTEXT_COLOR).pack(side="left", padx=10, pady=10)
         
         # Main area: Split into Chat and History
         split = ctk.CTkFrame(view, fg_color="transparent")
@@ -531,15 +537,10 @@ class HospitalApp(ctk.CTk):
         hist.pack(side="right", fill="y")
         ctk.CTkLabel(hist, text="Session Info", font=("Segoe UI", 14, "bold")).pack(pady=10)
         ctk.CTkButton(hist, text="Open Patient PDF", fg_color="transparent", border_width=1, command=self.open_pdf).pack(pady=5, padx=20, fill="x")
-        ctk.CTkButton(
-            hist,
-            text="📱 Send via WhatsApp",
-            fg_color="#25D366",
-            hover_color="#1ebe57",
-            text_color="#ffffff",
-            command=self.send_to_whatsapp,
-        ).pack(pady=5, padx=20, fill="x")
         ctk.CTkButton(hist, text="View Past Recordings", fg_color="transparent", border_width=1, command=self._view_recordings).pack(pady=5, padx=20, fill="x")
+        ctk.CTkButton(hist, text="Send via WhatsApp (API)", fg_color="#25D366", text_color="white", command=self.send_pdf_whatsapp).pack(pady=5, padx=20, fill="x")
+        ctk.CTkButton(hist, text="Share via WhatsApp (Free)", fg_color="#075e54", text_color="white", command=self.send_pdf_whatsapp_free).pack(pady=5, padx=20, fill="x")
+        ctk.CTkButton(hist, text="Send via Email", fg_color="#ea4335", text_color="white", command=self.send_pdf_email).pack(pady=5, padx=20, fill="x")
         ctk.CTkButton(hist, text="End Session", fg_color="#611", command=self.end_session).pack(side="bottom", pady=20, padx=20, fill="x")
 
     # ─── Consultation Logic ───
@@ -679,202 +680,6 @@ class HospitalApp(ctk.CTk):
         ReportGenerator.update_pdf(self.current_patient["id"], self.current_patient["name"])
         os.startfile(PATIENTS_DIR / self.current_patient["id"] / "consultation_history.pdf")
 
-    def send_to_whatsapp(self):
-        """Fully automatic: drives WhatsApp Web via Selenium to attach and
-        send the patient PDF report without any manual steps."""
-        pid   = self.current_patient["id"]
-        name  = self.current_patient["name"]
-        phone = self.current_patient.get("phone", "").strip()
-
-        if not phone:
-            messagebox.showerror(
-                "No Phone Number",
-                "No WhatsApp number is saved for this patient.\n\n"
-                "Please create a new consultation and enter the patient's\n"
-                "WhatsApp number (country code + number, no '+').",
-            )
-            return
-
-        # Regenerate / refresh the PDF first
-        ReportGenerator.update_pdf(pid, name)
-        pdf_path = str((PATIENTS_DIR / pid / "consultation_history.pdf").absolute())
-
-        # ── Progress window ───────────────────────────────────────────────
-        prog = ctk.CTkToplevel(self)
-        prog.title("Sending via WhatsApp")
-        prog.geometry("420x180")
-        prog.resizable(False, False)
-        prog.grab_set()
-
-        ctk.CTkLabel(prog, text="📱 Sending Report via WhatsApp",
-                     font=("Segoe UI", 15, "bold")).pack(pady=(20, 6))
-        status_lbl = ctk.CTkLabel(prog, text="Initialising…",
-                                  font=("Segoe UI", 12), text_color=SUBTEXT_COLOR,
-                                  wraplength=390)
-        status_lbl.pack(pady=4, padx=20)
-        progress_bar = ctk.CTkProgressBar(prog, mode="indeterminate", width=370)
-        progress_bar.pack(pady=10)
-        progress_bar.start()
-
-        def set_status(msg):
-            self.after(0, lambda: status_lbl.configure(text=msg))
-
-        def close_prog():
-            self.after(0, lambda: (progress_bar.stop(), prog.destroy()))
-
-        # ── Selenium worker (runs in background thread) ───────────────────
-        def _selenium_worker():
-            driver = None
-            try:
-                from selenium import webdriver
-                from selenium.webdriver.common.by import By
-                from selenium.webdriver.support.ui import WebDriverWait
-                from selenium.webdriver.support import expected_conditions as EC
-                from selenium.webdriver.chrome.options import Options
-                from selenium.webdriver.chrome.service import Service
-                from webdriver_manager.chrome import ChromeDriverManager
-                import time
-
-                phone_clean = phone.lstrip("+").replace(" ", "").replace("-", "")
-
-                # Persistent Chrome profile so QR code is only scanned ONCE
-                session_dir = str(Path("whatsapp_chrome_session").absolute())
-                Path(session_dir).mkdir(exist_ok=True)
-
-                options = Options()
-                options.add_argument(f"--user-data-dir={session_dir}")
-                options.add_argument("--profile-directory=Default")
-                options.add_argument("--no-sandbox")
-                options.add_argument("--disable-dev-shm-usage")
-                # Keep browser window visible so user can scan QR on first run
-                options.add_experimental_option("excludeSwitches", ["enable-automation"])
-                options.add_experimental_option("useAutomationExtension", False)
-
-                set_status("Starting Chrome — please wait…")
-                service = Service(ChromeDriverManager().install())
-                driver  = webdriver.Chrome(service=service, options=options)
-
-                # Build companion message
-                caption = (
-                    f"\U0001f3e5 *Medical Consultation Report*\n"
-                    f"Patient : {name}\n"
-                    f"ID      : {pid}\n"
-                    f"Date    : {datetime.now().strftime('%d %b %Y')}"
-                )
-
-                set_status("Opening WhatsApp Web…\n(Scan QR code if prompted — only needed once)")
-                driver.get(f"https://web.whatsapp.com/send?phone={phone_clean}&text={urllib.parse.quote(caption)}")
-
-                wait = WebDriverWait(driver, 120)   # up to 2 min for QR scan
-
-                # ── Wait until the chat message-box is visible ─────────────
-                set_status("Waiting for chat to open… (scan QR if shown)")
-                MSGBOX_XPATHS = [
-                    '//div[@contenteditable="true"][@data-tab="10"]',
-                    '//div[@contenteditable="true"][@title="Type a message"]',
-                    '//div[@contenteditable="true"][contains(@class,"copyable-text")]',
-                ]
-                msg_box = None
-                for xp in MSGBOX_XPATHS:
-                    try:
-                        msg_box = wait.until(EC.presence_of_element_located((By.XPATH, xp)))
-                        break
-                    except Exception:
-                        pass
-                if msg_box is None:
-                    raise RuntimeError("Could not find WhatsApp chat input. Is the number valid?")
-
-                time.sleep(2)   # let the page settle
-
-                # ── Click the Attach (paperclip) button ────────────────────
-                set_status("Attaching PDF…")
-                ATTACH_SELECTORS = [
-                    (By.CSS_SELECTOR, 'div[title="Attach"]'),
-                    (By.CSS_SELECTOR, 'button[title="Attach"]'),
-                    (By.XPATH, '//*[@data-testid="clip"]'),
-                    (By.XPATH, '//*[@data-icon="attach-menu-plus"]'),
-                    (By.XPATH, '//span[@data-icon="clip"]'),
-                ]
-                attach_btn = None
-                for by, sel in ATTACH_SELECTORS:
-                    try:
-                        attach_btn = WebDriverWait(driver, 6).until(
-                            EC.element_to_be_clickable((by, sel)))
-                        break
-                    except Exception:
-                        pass
-                if attach_btn is None:
-                    raise RuntimeError("Could not find the Attach button in WhatsApp Web.")
-
-                attach_btn.click()
-                time.sleep(1.5)
-
-                # ── Feed the PDF path directly into the hidden file <input> ─
-                FILE_INPUT_SELECTORS = [
-                    'input[type="file"][accept="*"]',
-                    'input[type="file"]',
-                ]
-                file_input = None
-                for sel in FILE_INPUT_SELECTORS:
-                    try:
-                        file_input = WebDriverWait(driver, 6).until(
-                            EC.presence_of_element_located((By.CSS_SELECTOR, sel)))
-                        break
-                    except Exception:
-                        pass
-                if file_input is None:
-                    raise RuntimeError("Could not find file input in WhatsApp Web.")
-
-                file_input.send_keys(pdf_path)
-                time.sleep(3)   # wait for preview to render
-
-                # ── Click the final Send button ────────────────────────────
-                set_status("Sending report…")
-                SEND_SELECTORS = [
-                    (By.CSS_SELECTOR,  'span[data-icon="send"]'),
-                    (By.XPATH,         '//*[@data-testid="send"]'),
-                    (By.XPATH,         '//span[@data-icon="send"]'),
-                    (By.CSS_SELECTOR,  '[data-testid="send"]'),
-                ]
-                send_btn = None
-                for by, sel in SEND_SELECTORS:
-                    try:
-                        send_btn = WebDriverWait(driver, 10).until(
-                            EC.element_to_be_clickable((by, sel)))
-                        break
-                    except Exception:
-                        pass
-                if send_btn is None:
-                    raise RuntimeError("Could not find Send button after file was attached.")
-
-                send_btn.click()
-                time.sleep(4)   # wait for upload to complete
-
-                set_status("✅ Report sent successfully!")
-                time.sleep(2)
-                driver.quit()
-                close_prog()
-                self.after(0, lambda: messagebox.showinfo(
-                    "WhatsApp", f"Report sent to {phone_clean} successfully!"))
-
-            except Exception as exc:
-                if driver:
-                    try:
-                        driver.quit()
-                    except Exception:
-                        pass
-                close_prog()
-                self.after(0, lambda e=str(exc): messagebox.showerror(
-                    "WhatsApp Error",
-                    f"Could not send report automatically:\n\n{e}\n\n"
-                    "Tips:\n"
-                    "• Make sure Chrome is installed.\n"
-                    "• Check that the phone number includes the country code.\n"
-                    "• If it's your first run, you must scan the WhatsApp QR code once.",
-                ))
-
-        threading.Thread(target=_selenium_worker, daemon=True).start()
-
     def end_session(self):
         # Save session recording
         if self.session_recordings:
@@ -939,6 +744,140 @@ class HospitalApp(ctk.CTk):
             ctk.CTkLabel(f_frame, text=label_text, font=("Segoe UI", 11)).pack(side="left")
             ctk.CTkButton(f_frame, text="▶ Play", width=50, height=24, command=lambda path=str(f): threading.Thread(target=AIService._play_audio, args=(path,), daemon=True).start()).pack(side="right")
             ctk.CTkButton(f_frame, text="📂 Open", width=50, height=24, command=lambda path=str(f): os.startfile(os.path.dirname(path))).pack(side="right", padx=5)
+
+    def send_pdf_whatsapp(self):
+        phone = self.current_patient.get("phone_number")
+        if not phone or phone == "N/A":
+            messagebox.showerror("Error", "No phone number available for this patient.")
+            return
+
+        pdf_path = PATIENTS_DIR / self.current_patient["id"] / "consultation_history.pdf"
+        if not pdf_path.exists():
+            ReportGenerator.update_pdf(self.current_patient["id"], self.current_patient["name"])
+            if not pdf_path.exists():
+                messagebox.showerror("Error", "No consultation data to send.")
+                return
+
+        def send_task():
+            import requests
+            try:
+                url = "https://tmpfiles.org/api/v1/upload"
+                with open(pdf_path, "rb") as f:
+                    response = requests.post(url, files={"file": f})
+                if response.status_code == 200:
+                    data = response.json()
+                    file_url = data["data"]["url"]
+                    direct_url = file_url.replace("tmpfiles.org/", "tmpfiles.org/dl/")
+                else:
+                    self.after(0, lambda: messagebox.showerror("Upload Error", "Failed to upload PDF for sending."))
+                    return
+            except Exception as e:
+                self.after(0, lambda e=e: messagebox.showerror("Upload Error", f"Exception during upload: {e}"))
+                return
+            
+            from twilio.rest import Client
+            import os
+            sid = os.environ.get("TWILIO_ACCOUNT_SID")
+            token = os.environ.get("TWILIO_AUTH_TOKEN")
+            from_num = os.environ.get("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
+
+            if not sid or not token:
+                self.after(0, lambda: messagebox.showerror("Twilio Error", "Twilio credentials not configured in .env"))
+                return
+
+            try:
+                client = Client(sid, token)
+                message = client.messages.create(
+                    from_=from_num,
+                    body=f"Hello {self.current_patient['name']}, here is your medical consultation report.",
+                    to=f"whatsapp:{phone}",
+                    media_url=[direct_url]
+                )
+                self.after(0, lambda: messagebox.showinfo("Success", f"WhatsApp message sent! SID: {message.sid}"))
+            except Exception as e:
+                self.after(0, lambda e=e: messagebox.showerror("Twilio Error", f"Failed to send: {e}"))
+
+        threading.Thread(target=send_task, daemon=True).start()
+
+    def send_pdf_whatsapp_free(self):
+        """Free alternative: Opens a WhatsApp web link with the PDF hosted link."""
+        phone = self.current_patient.get("phone_number")
+        if not phone or phone == "N/A":
+            messagebox.showerror("Error", "No phone number available.")
+            return
+        
+        pdf_path = PATIENTS_DIR / self.current_patient["id"] / "consultation_history.pdf"
+        if not pdf_path.exists():
+            ReportGenerator.update_pdf(self.current_patient["id"], self.current_patient["name"])
+        
+        def upload_and_open():
+            import requests, webbrowser, urllib.parse
+            try:
+                url = "https://tmpfiles.org/api/v1/upload"
+                with open(pdf_path, "rb") as f:
+                    response = requests.post(url, files={"file": f})
+                if response.status_code == 200:
+                    data = response.json()
+                    file_url = data["data"]["url"]
+                    direct_url = file_url.replace("tmpfiles.org/", "tmpfiles.org/dl/")
+                    msg = f"Hello {self.current_patient['name']}, here is your medical report: {direct_url}"
+                    encoded_msg = urllib.parse.quote(msg)
+                    clean_phone = phone.replace("+", "").replace(" ", "")
+                    wa_url = f"https://wa.me/{clean_phone}?text={encoded_msg}"
+                    webbrowser.open(wa_url)
+                else:
+                    self.after(0, lambda: messagebox.showerror("Error", "Failed to upload PDF for sharing."))
+            except Exception as e:
+                self.after(0, lambda e=e: messagebox.showerror("Error", f"Failed to share: {e}"))
+
+        threading.Thread(target=upload_and_open, daemon=True).start()
+
+    def send_pdf_email(self):
+        """Free alternative: Sends PDF via Email using SMTP configuration."""
+        email = self.current_patient.get("email")
+        if not email or "@" not in email:
+            messagebox.showerror("Error", "No valid email address available.")
+            return
+
+        pdf_path = PATIENTS_DIR / self.current_patient["id"] / "consultation_history.pdf"
+        if not pdf_path.exists():
+            ReportGenerator.update_pdf(self.current_patient["id"], self.current_patient["name"])
+
+        def email_task():
+            import smtplib, os
+            from email.message import EmailMessage
+            
+            host = os.environ.get("SMTP_HOST")
+            port = int(os.environ.get("SMTP_PORT", 587))
+            user = os.environ.get("SMTP_USER")
+            password = os.environ.get("SMTP_PASS")
+            sender = os.environ.get("SMTP_FROM", f"Clinic AI <{user}>")
+
+            if not user or not password:
+                self.after(0, lambda: messagebox.showerror("Email Error", "SMTP credentials not configured in .env"))
+                return
+
+            try:
+                msg = EmailMessage()
+                msg['Subject'] = f"Medical Consultation Report - {self.current_patient['name']}"
+                msg['From'] = sender
+                msg['To'] = email
+                msg.set_content(f"Hello {self.current_patient['name']},\n\nPlease find attached your medical consultation report.\n\nRegards,\nClinic AI Team")
+
+                with open(pdf_path, 'rb') as f:
+                    file_data = f.read()
+                    msg.add_attachment(file_data, maintype='application', subtype='pdf', filename=f"{self.current_patient['name']}_report.pdf")
+
+                with smtplib.SMTP(host, port) as server:
+                    server.starttls()
+                    server.login(user, password)
+                    server.send_message(msg)
+                
+                self.after(0, lambda: messagebox.showinfo("Success", f"Report sent to {email} successfully!"))
+            except Exception as e:
+                self.after(0, lambda e=e: messagebox.showerror("Email Error", f"Failed to send email: {e}"))
+
+        threading.Thread(target=email_task, daemon=True).start()
 
 if __name__ == "__main__":
     app = HospitalApp()

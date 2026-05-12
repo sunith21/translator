@@ -10,6 +10,7 @@ pygame
 sacremoses
 requests
 python-dotenv
+twilio
 customtkinter
 fpdf2
 pydub
