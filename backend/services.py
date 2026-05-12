@@ -17,6 +17,8 @@ from pydub import AudioSegment
 #  Lazy Model Cache
 # ─────────────────────────────────────────────
 _MODEL_CACHE = {}
+_TRANSLATION_CACHE = {}
+_TRANSLATION_CACHE_MAX = 2000
 
 def get_whisper(size="base"):
     if f"whisper_{size}" not in _MODEL_CACHE:
@@ -270,6 +272,9 @@ Return ONLY the corrected transcript text with no extra commentary."""
 
     @staticmethod
     def translate(text, direction, lang_key):
+        cache_key = (text or "", direction or "", lang_key or "")
+        if cache_key in _TRANSLATION_CACHE:
+            return _TRANSLATION_CACHE[cache_key]
         try:
             if direction == "en_to_native":
                 if lang_key == "Hindi (हिन्दी)":
@@ -283,6 +288,9 @@ Return ONLY the corrected transcript text with no extra commentary."""
                 else:
                     src = AIService._get_nllb_code(lang_key)
                     res = AIService._translate_nllb(text, src, "eng_Latn")
+            _TRANSLATION_CACHE[cache_key] = res
+            if len(_TRANSLATION_CACHE) > _TRANSLATION_CACHE_MAX:
+                _TRANSLATION_CACHE.pop(next(iter(_TRANSLATION_CACHE)))
             return res
         except Exception as e:
             return f"Error: {str(e)}"

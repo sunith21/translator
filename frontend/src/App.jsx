@@ -384,6 +384,10 @@ function Consultation({ patient, onEnd }) {
       fd.append('doctor_lang_key', dlk);
       fd.append('patient_id', pid);
       const res = await axios.post(`${API_BASE}/stt`, fd);
+      if (res.data?.ignored) {
+        setStatus(`Skipped: ${res.data.reason || 'Unsupported language detected.'}`);
+        return;
+      }
       const resolvedRole = res.data.role || role;
       const entry = {
         role: resolvedRole,
@@ -391,6 +395,9 @@ function Consultation({ patient, onEnd }) {
         translated: res.data.translated,
         audio_filename: res.data.audio_filename || null,
         translated_audio_filename: res.data.translated_audio_filename || null,
+        stt_confidence: res.data.stt_confidence ?? null,
+        low_confidence: !!res.data.low_confidence,
+        stt_engine: res.data.stt_engine || null,
       };
       entry.translated_audio_filename = await ensureTranslatedClip(entry);
       await axios.post(`${API_BASE}/patients/${pid}/append_transcript`, entry);
@@ -514,12 +521,19 @@ function Consultation({ patient, onEnd }) {
           fd.append('patient_id', patient.id);
           setStatus('Transcribing & translating…');
           const res   = await axios.post(`${API_BASE}/stt`, fd);
+          if (res.data?.ignored) {
+            setStatus(`Skipped: ${res.data.reason || 'Unsupported language detected.'}`);
+            return;
+          }
           const entry = {
             role,
             original: res.data.original,
             translated: res.data.translated,
             audio_filename: res.data.audio_filename || null,
             translated_audio_filename: res.data.translated_audio_filename || null,
+            stt_confidence: res.data.stt_confidence ?? null,
+            low_confidence: !!res.data.low_confidence,
+            stt_engine: res.data.stt_engine || null,
           };
           entry.translated_audio_filename = await ensureTranslatedClip(entry);
           await axios.post(`${API_BASE}/patients/${patient.id}/append_transcript`, entry);
@@ -782,7 +796,18 @@ function Consultation({ patient, onEnd }) {
                 <div className="message-header">
                   <span className={`role-badge ${m.role}`}>{m.role.toUpperCase()}</span>
                   <span className="msg-time">{m.timestamp}</span>
+                  {typeof m.stt_confidence === 'number' && (
+                    <span className="msg-time" style={{ marginLeft: 8 }}>
+                      STT {Math.round(m.stt_confidence * 100)}%
+                    </span>
+                  )}
                 </div>
+                {m.low_confidence && (
+                  <p className="msg-label" style={{ color: '#f59e0b', marginTop: '6px' }}>
+                    Low-confidence transcription. Repeating this sentence can improve accuracy.
+                    {m.stt_engine ? ` (${m.stt_engine})` : ''}
+                  </p>
+                )}
                 <p className="msg-original"><span className="msg-label">Original:</span> {m.original}</p>
                 <p className="msg-translated"><span className="msg-label">Translated:</span> {m.translated}</p>
                 {m.audio_filename && (
