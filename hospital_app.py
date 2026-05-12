@@ -1,4 +1,6 @@
 import os
+import webbrowser
+import urllib.parse
 import json
 import threading
 import tempfile
@@ -80,15 +82,23 @@ class PatientManager:
                 CREATE TABLE IF NOT EXISTS patients (
                     id TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
+                    phone TEXT DEFAULT '',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     last_visit TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            # Migrate existing DBs that lack the phone column
+            try:
+                conn.execute("ALTER TABLE patients ADD COLUMN phone TEXT DEFAULT ''")
+            except Exception:
+                pass  # Column already exists
 
-    def add_patient(self, patient_id, name):
+    def add_patient(self, patient_id, name, phone=""):
         with sqlite3.connect(self.db_path) as conn:
-            conn.execute("INSERT OR REPLACE INTO patients (id, name, last_visit) VALUES (?, ?, ?)",
-                         (patient_id, name, datetime.now()))
+            conn.execute(
+                "INSERT OR REPLACE INTO patients (id, name, phone, last_visit) VALUES (?, ?, ?, ?)",
+                (patient_id, name, phone, datetime.now()),
+            )
         
         # Create directory structure
         p_dir = PATIENTS_DIR / patient_id
@@ -103,9 +113,12 @@ class PatientManager:
 
     def get_patient(self, patient_id):
         with sqlite3.connect(self.db_path) as conn:
-            res = conn.execute("SELECT id, name, last_visit FROM patients WHERE id = ?", (patient_id,)).fetchone()
+            res = conn.execute(
+                "SELECT id, name, phone, last_visit FROM patients WHERE id = ?",
+                (patient_id,),
+            ).fetchone()
             if res:
-                return {"id": res[0], "name": res[1], "last_visit": res[2]}
+                return {"id": res[0], "name": res[1], "phone": res[2] or "", "last_visit": res[3]}
         return None
 
     def search_patients(self, query):
@@ -410,15 +423,25 @@ class HospitalApp(ctk.CTk):
         self.clear_main()
         form = ctk.CTkFrame(self.main_container, fg_color=CARD_COLOR, corner_radius=10, width=400)
         form.place(relx=0.5, rely=0.4, anchor="center")
-        
+
         ctk.CTkLabel(form, text="New Consultation", font=("Segoe UI", 18, "bold"), text_color=ACCENT).pack(pady=20)
-        
+
         self.entry_name = ctk.CTkEntry(form, placeholder_text="Patient Name", width=300)
         self.entry_name.pack(pady=10)
-        
+
         self.entry_id = ctk.CTkEntry(form, placeholder_text="Unique Patient ID", width=300)
         self.entry_id.pack(pady=10)
-        
+
+        self.entry_phone = ctk.CTkEntry(form, placeholder_text="WhatsApp Number (e.g. 919876543210)", width=300)
+        self.entry_phone.pack(pady=10)
+
+        ctk.CTkLabel(
+            form,
+            text="Include country code, no '+' or spaces",
+            text_color=SUBTEXT_COLOR,
+            font=("Segoe UI", 10),
+        ).pack()
+
         ctk.CTkButton(form, text="Start Session", command=self.handle_new_session, fg_color=ACCENT).pack(pady=20)
 
     def show_search(self):
@@ -453,10 +476,11 @@ class HospitalApp(ctk.CTk):
             btn.pack(fill="x", pady=2)
 
     def handle_new_session(self):
-        name = self.entry_name.get()
-        pid = self.entry_id.get()
+        name = self.entry_name.get().strip()
+        pid = self.entry_id.get().strip()
+        phone = self.entry_phone.get().strip()
         if name and pid:
-            self.db.add_patient(pid, name)
+            self.db.add_patient(pid, name, phone)
             self.load_patient(pid)
 
     def load_patient(self, pid):
@@ -507,6 +531,14 @@ class HospitalApp(ctk.CTk):
         hist.pack(side="right", fill="y")
         ctk.CTkLabel(hist, text="Session Info", font=("Segoe UI", 14, "bold")).pack(pady=10)
         ctk.CTkButton(hist, text="Open Patient PDF", fg_color="transparent", border_width=1, command=self.open_pdf).pack(pady=5, padx=20, fill="x")
+        ctk.CTkButton(
+            hist,
+            text="📱 Send via WhatsApp",
+            fg_color="#25D366",
+            hover_color="#1ebe57",
+            text_color="#ffffff",
+            command=self.send_to_whatsapp,
+        ).pack(pady=5, padx=20, fill="x")
         ctk.CTkButton(hist, text="View Past Recordings", fg_color="transparent", border_width=1, command=self._view_recordings).pack(pady=5, padx=20, fill="x")
         ctk.CTkButton(hist, text="End Session", fg_color="#611", command=self.end_session).pack(side="bottom", pady=20, padx=20, fill="x")
 
@@ -646,6 +678,202 @@ class HospitalApp(ctk.CTk):
     def open_pdf(self):
         ReportGenerator.update_pdf(self.current_patient["id"], self.current_patient["name"])
         os.startfile(PATIENTS_DIR / self.current_patient["id"] / "consultation_history.pdf")
+
+    def send_to_whatsapp(self):
+        """Fully automatic: drives WhatsApp Web via Selenium to attach and
+        send the patient PDF report without any manual steps."""
+        pid   = self.current_patient["id"]
+        name  = self.current_patient["name"]
+        phone = self.current_patient.get("phone", "").strip()
+
+        if not phone:
+            messagebox.showerror(
+                "No Phone Number",
+                "No WhatsApp number is saved for this patient.\n\n"
+                "Please create a new consultation and enter the patient's\n"
+                "WhatsApp number (country code + number, no '+').",
+            )
+            return
+
+        # Regenerate / refresh the PDF first
+        ReportGenerator.update_pdf(pid, name)
+        pdf_path = str((PATIENTS_DIR / pid / "consultation_history.pdf").absolute())
+
+        # ── Progress window ───────────────────────────────────────────────
+        prog = ctk.CTkToplevel(self)
+        prog.title("Sending via WhatsApp")
+        prog.geometry("420x180")
+        prog.resizable(False, False)
+        prog.grab_set()
+
+        ctk.CTkLabel(prog, text="📱 Sending Report via WhatsApp",
+                     font=("Segoe UI", 15, "bold")).pack(pady=(20, 6))
+        status_lbl = ctk.CTkLabel(prog, text="Initialising…",
+                                  font=("Segoe UI", 12), text_color=SUBTEXT_COLOR,
+                                  wraplength=390)
+        status_lbl.pack(pady=4, padx=20)
+        progress_bar = ctk.CTkProgressBar(prog, mode="indeterminate", width=370)
+        progress_bar.pack(pady=10)
+        progress_bar.start()
+
+        def set_status(msg):
+            self.after(0, lambda: status_lbl.configure(text=msg))
+
+        def close_prog():
+            self.after(0, lambda: (progress_bar.stop(), prog.destroy()))
+
+        # ── Selenium worker (runs in background thread) ───────────────────
+        def _selenium_worker():
+            driver = None
+            try:
+                from selenium import webdriver
+                from selenium.webdriver.common.by import By
+                from selenium.webdriver.support.ui import WebDriverWait
+                from selenium.webdriver.support import expected_conditions as EC
+                from selenium.webdriver.chrome.options import Options
+                from selenium.webdriver.chrome.service import Service
+                from webdriver_manager.chrome import ChromeDriverManager
+                import time
+
+                phone_clean = phone.lstrip("+").replace(" ", "").replace("-", "")
+
+                # Persistent Chrome profile so QR code is only scanned ONCE
+                session_dir = str(Path("whatsapp_chrome_session").absolute())
+                Path(session_dir).mkdir(exist_ok=True)
+
+                options = Options()
+                options.add_argument(f"--user-data-dir={session_dir}")
+                options.add_argument("--profile-directory=Default")
+                options.add_argument("--no-sandbox")
+                options.add_argument("--disable-dev-shm-usage")
+                # Keep browser window visible so user can scan QR on first run
+                options.add_experimental_option("excludeSwitches", ["enable-automation"])
+                options.add_experimental_option("useAutomationExtension", False)
+
+                set_status("Starting Chrome — please wait…")
+                service = Service(ChromeDriverManager().install())
+                driver  = webdriver.Chrome(service=service, options=options)
+
+                # Build companion message
+                caption = (
+                    f"\U0001f3e5 *Medical Consultation Report*\n"
+                    f"Patient : {name}\n"
+                    f"ID      : {pid}\n"
+                    f"Date    : {datetime.now().strftime('%d %b %Y')}"
+                )
+
+                set_status("Opening WhatsApp Web…\n(Scan QR code if prompted — only needed once)")
+                driver.get(f"https://web.whatsapp.com/send?phone={phone_clean}&text={urllib.parse.quote(caption)}")
+
+                wait = WebDriverWait(driver, 120)   # up to 2 min for QR scan
+
+                # ── Wait until the chat message-box is visible ─────────────
+                set_status("Waiting for chat to open… (scan QR if shown)")
+                MSGBOX_XPATHS = [
+                    '//div[@contenteditable="true"][@data-tab="10"]',
+                    '//div[@contenteditable="true"][@title="Type a message"]',
+                    '//div[@contenteditable="true"][contains(@class,"copyable-text")]',
+                ]
+                msg_box = None
+                for xp in MSGBOX_XPATHS:
+                    try:
+                        msg_box = wait.until(EC.presence_of_element_located((By.XPATH, xp)))
+                        break
+                    except Exception:
+                        pass
+                if msg_box is None:
+                    raise RuntimeError("Could not find WhatsApp chat input. Is the number valid?")
+
+                time.sleep(2)   # let the page settle
+
+                # ── Click the Attach (paperclip) button ────────────────────
+                set_status("Attaching PDF…")
+                ATTACH_SELECTORS = [
+                    (By.CSS_SELECTOR, 'div[title="Attach"]'),
+                    (By.CSS_SELECTOR, 'button[title="Attach"]'),
+                    (By.XPATH, '//*[@data-testid="clip"]'),
+                    (By.XPATH, '//*[@data-icon="attach-menu-plus"]'),
+                    (By.XPATH, '//span[@data-icon="clip"]'),
+                ]
+                attach_btn = None
+                for by, sel in ATTACH_SELECTORS:
+                    try:
+                        attach_btn = WebDriverWait(driver, 6).until(
+                            EC.element_to_be_clickable((by, sel)))
+                        break
+                    except Exception:
+                        pass
+                if attach_btn is None:
+                    raise RuntimeError("Could not find the Attach button in WhatsApp Web.")
+
+                attach_btn.click()
+                time.sleep(1.5)
+
+                # ── Feed the PDF path directly into the hidden file <input> ─
+                FILE_INPUT_SELECTORS = [
+                    'input[type="file"][accept="*"]',
+                    'input[type="file"]',
+                ]
+                file_input = None
+                for sel in FILE_INPUT_SELECTORS:
+                    try:
+                        file_input = WebDriverWait(driver, 6).until(
+                            EC.presence_of_element_located((By.CSS_SELECTOR, sel)))
+                        break
+                    except Exception:
+                        pass
+                if file_input is None:
+                    raise RuntimeError("Could not find file input in WhatsApp Web.")
+
+                file_input.send_keys(pdf_path)
+                time.sleep(3)   # wait for preview to render
+
+                # ── Click the final Send button ────────────────────────────
+                set_status("Sending report…")
+                SEND_SELECTORS = [
+                    (By.CSS_SELECTOR,  'span[data-icon="send"]'),
+                    (By.XPATH,         '//*[@data-testid="send"]'),
+                    (By.XPATH,         '//span[@data-icon="send"]'),
+                    (By.CSS_SELECTOR,  '[data-testid="send"]'),
+                ]
+                send_btn = None
+                for by, sel in SEND_SELECTORS:
+                    try:
+                        send_btn = WebDriverWait(driver, 10).until(
+                            EC.element_to_be_clickable((by, sel)))
+                        break
+                    except Exception:
+                        pass
+                if send_btn is None:
+                    raise RuntimeError("Could not find Send button after file was attached.")
+
+                send_btn.click()
+                time.sleep(4)   # wait for upload to complete
+
+                set_status("✅ Report sent successfully!")
+                time.sleep(2)
+                driver.quit()
+                close_prog()
+                self.after(0, lambda: messagebox.showinfo(
+                    "WhatsApp", f"Report sent to {phone_clean} successfully!"))
+
+            except Exception as exc:
+                if driver:
+                    try:
+                        driver.quit()
+                    except Exception:
+                        pass
+                close_prog()
+                self.after(0, lambda e=str(exc): messagebox.showerror(
+                    "WhatsApp Error",
+                    f"Could not send report automatically:\n\n{e}\n\n"
+                    "Tips:\n"
+                    "• Make sure Chrome is installed.\n"
+                    "• Check that the phone number includes the country code.\n"
+                    "• If it's your first run, you must scan the WhatsApp QR code once.",
+                ))
+
+        threading.Thread(target=_selenium_worker, daemon=True).start()
 
     def end_session(self):
         # Save session recording

@@ -16,3 +16,5 @@ pydub
 fastapi
 uvicorn
 python-multipart
+selenium
+webdriver-manager
