@@ -6,41 +6,21 @@ from datetime import datetime
 from pathlib import Path
 import requests
 import whisper
-import torch
 import numpy as np
 import scipy.io.wavfile as wav
-from transformers import MarianMTModel, MarianTokenizer, AutoModelForSeq2SeqLM, AutoTokenizer
 from fpdf import FPDF
 from pydub import AudioSegment
+from medical_translation import translate_medical_text
 
 # ─────────────────────────────────────────────
 #  Lazy Model Cache
 # ─────────────────────────────────────────────
 _MODEL_CACHE = {}
-_TRANSLATION_CACHE = {}
-_TRANSLATION_CACHE_MAX = 2000
 
 def get_whisper(size="base"):
     if f"whisper_{size}" not in _MODEL_CACHE:
         _MODEL_CACHE[f"whisper_{size}"] = whisper.load_model(size)
     return _MODEL_CACHE[f"whisper_{size}"]
-
-def get_marian(model_name):
-    if model_name not in _MODEL_CACHE:
-        _MODEL_CACHE[model_name] = {
-            "tokenizer": MarianTokenizer.from_pretrained(model_name),
-            "model": MarianMTModel.from_pretrained(model_name),
-        }
-    return _MODEL_CACHE[model_name]
-
-def get_nllb():
-    model_name = "facebook/nllb-200-distilled-600M"
-    if model_name not in _MODEL_CACHE:
-        _MODEL_CACHE[model_name] = {
-            "tokenizer": AutoTokenizer.from_pretrained(model_name, use_fast=False),
-            "model": AutoModelForSeq2SeqLM.from_pretrained(model_name),
-        }
-    return _MODEL_CACHE[model_name]
 
 # ─────────────────────────────────────────────
 #  Constants
@@ -324,6 +304,13 @@ Return ONLY the corrected transcript text with no extra commentary."""
             "Konkani (कोंकणी)": "mar_Deva"  # Fallback to Marathi as NLLB lacks Konkani
         }
         return codes.get(lang_key, "hin_Deva")
+
+    @staticmethod
+    def translate(text, direction, lang_key):
+        try:
+            return translate_medical_text(text, direction, lang_key)
+        except Exception as e:
+            return f"Error: {str(e)}"
 
     @staticmethod
     def sarvam_stt(wav_path, lang_code):

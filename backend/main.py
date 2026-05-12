@@ -252,6 +252,7 @@ async def speech_to_text(
             stt_confidence, low_confidence = _score_stt_quality(
                 original, doctor_lang_key, script_ok, stt_retried, stt_engine
             )
+            original = ai.correct_transcript(original)
 
             # Translate: doctor_lang → patient_lang
             # If both are the same, no translation needed
@@ -296,6 +297,7 @@ async def speech_to_text(
             stt_confidence, low_confidence = _score_stt_quality(
                 original, lang_key, script_ok, stt_retried, stt_engine
             )
+            original = ai.correct_transcript(original)
 
             # Translate: patient_lang → doctor_lang
             if lang_key == doctor_lang_key:
@@ -310,7 +312,6 @@ async def speech_to_text(
                 translated = ai.translate(english_pivot, "en_to_native", doctor_lang_key)
         
         # ── Medical transcript correction (LLM post-processing) ────────────
-        original   = ai.correct_transcript(original)
         # ───────────────────────────────────────────────────────────────────
 
         # Final guard: if transcript still looks off-language and confidence is low,

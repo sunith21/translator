@@ -6,6 +6,7 @@ import tempfile
 import os
 from datetime import datetime
 import queue
+from medical_translation import translate_medical_text, warm_translation_models
 
 # Load .env for SARVAM_API_KEY
 from dotenv import load_dotenv
@@ -61,6 +62,10 @@ def _nllb_translate(text: str, src_lang: str, tgt_lang: str) -> str:
         tokens = model.generate(**inputs, forced_bos_token_id=bos_id,
                                 max_length=512, num_beams=4, early_stopping=True)
     return tokenizer.decode(tokens[0], skip_special_tokens=True)
+
+
+def _make_translator(direction: str, lang_key: str):
+    return lambda text: translate_medical_text(text, direction, lang_key)
 
 
 
@@ -184,26 +189,26 @@ def speak_text(text: str, lang_key: str):
 LANGUAGES = {
     "Hindi (हिन्दी)": {
         "native":      "Hindi (हिन्दी)",
-        "en_to":       lambda t: translate_marian(t, "Helsinki-NLP/opus-mt-en-hi"),
-        "to_en":       lambda t: translate_marian(t, "Helsinki-NLP/opus-mt-hi-en"),
+        "en_to":       _make_translator("en_to_native", "Hindi (हिन्दी)"),
+        "to_en":       _make_translator("native_to_en", "Hindi (हिन्दी)"),
         "font_native": ("Nirmala UI", 14),
     },
     "Kannada (ಕನ್ನಡ)": {
         "native":      "Kannada (ಕನ್ನಡ)",
-        "en_to":       lambda t: _nllb_translate(t, "eng_Latn", "kan_Knda"),
-        "to_en":       lambda t: _nllb_translate(t, "kan_Knda", "eng_Latn"),
+        "en_to":       _make_translator("en_to_native", "Kannada (ಕನ್ನಡ)"),
+        "to_en":       _make_translator("native_to_en", "Kannada (ಕನ್ನಡ)"),
         "font_native": ("Noto Sans Kannada", 14),
     },
     "Marathi (मराठी)": {
         "native":      "Marathi (मराठी)",
-        "en_to":       lambda t: _nllb_translate(t, "eng_Latn", "mar_Deva"),
-        "to_en":       lambda t: _nllb_translate(t, "mar_Deva", "eng_Latn"),
+        "en_to":       _make_translator("en_to_native", "Marathi (मराठी)"),
+        "to_en":       _make_translator("native_to_en", "Marathi (मराठी)"),
         "font_native": ("Nirmala UI", 14),
     },
     "Bengali (বাংলা)": {
         "native":      "Bengali (বাংলা)",
-        "en_to":       lambda t: _nllb_translate(t, "eng_Latn", "ben_Beng"),
-        "to_en":       lambda t: _nllb_translate(t, "ben_Beng", "eng_Latn"),
+        "en_to":       _make_translator("en_to_native", "Bengali (বাংলা)"),
+        "to_en":       _make_translator("native_to_en", "Bengali (বাংলা)"),
         "font_native": ("Noto Sans Bengali", 14),
     },
 }
@@ -239,6 +244,7 @@ class TranslatorApp(ctk.CTk):
         self.audio_queue = None
         self.audio_stream = None
         self._build_ui()
+        self.after(200, self._preload_translation_model)
 
     # ── UI construction ──────────────────────
     def _build_ui(self):
@@ -350,6 +356,7 @@ class TranslatorApp(ctk.CTk):
 
     def _on_combo_selected(self, choice):
         self._update_direction_label()
+        self._preload_translation_model()
 
     # ── direction helpers ─────────────────────
     def _lang_short(self) -> str:
@@ -381,6 +388,19 @@ class TranslatorApp(ctk.CTk):
 
         self._set_output("", font=None)
         self.status_var.set("Direction swapped.")
+        self._preload_translation_model()
+
+    def _preload_translation_model(self):
+        lang_key = self.lang_var.get()
+        direction = self._direction
+
+        def worker():
+            try:
+                warm_translation_models(direction, lang_key)
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
 
     # ── helpers ──────────────────────────────
     def _on_input_change(self, _event=None):

@@ -23,6 +23,7 @@ import scipy.io.wavfile as wav
 from transformers import MarianMTModel, MarianTokenizer, AutoModelForSeq2SeqLM, AutoTokenizer
 from gtts import gTTS
 import pygame
+from medical_translation import translate_medical_text
 
 # Load environment variables
 load_dotenv()
@@ -273,6 +274,13 @@ class AIService:
             "Bengali (বাংলা)": "ben_Beng"
         }
         return codes.get(lang_key, "hin_Deva")
+
+    @staticmethod
+    def translate(text, direction, lang_key):
+        try:
+            return translate_medical_text(text, direction, lang_key)
+        except Exception as e:
+            return f"Error: {str(e)}"
 
     @staticmethod
     def sarvam_stt(wav_path, lang_code):
