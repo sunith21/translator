@@ -4,6 +4,7 @@ import threading
 import tempfile
 import queue
 import sqlite3
+import shutil
 from datetime import datetime
 from pathlib import Path
 
@@ -286,13 +287,15 @@ class AIService:
 
     @staticmethod
     def speak(text, lang_key, is_indian=True):
+        """
+        Generate speech, play it, and return saved audio path.
+        """
         if is_indian:
-            AIService.sarvam_tts(text, lang_key)
-        else:
-            AIService.gtts_speak(text)
+            return AIService.sarvam_tts(text, lang_key)
+        return AIService.gtts_speak(text)
 
     @staticmethod
-    def sarvam_tts(text, lang_key):
+    def sarvam_tts(text, lang_key, output_path=None):
         api_key = os.environ.get("SARVAM_API_KEY", "")
         lang_map = {"Hindi (हिन्दी)": "hi-IN", "Kannada (ಕನ್ನಡ)": "kn-IN", "Marathi (मराठी)": "mr-IN", "Bengali (বাংলা)": "bn-IN"}
         lang_code = lang_map.get(lang_key, "hi-IN")
@@ -304,20 +307,32 @@ class AIService:
         if response.status_code == 200:
             import base64
             audio_data = base64.b64decode(response.json().get("audio_output", ""))
+            if output_path:
+                with open(output_path, "wb") as f:
+                    f.write(audio_data)
+                AIService._play_audio(output_path)
+                return output_path
             tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
             tmp.write(audio_data)
             tmp.close()
             AIService._play_audio(tmp.name)
             os.unlink(tmp.name)
+            return None
+        return None
 
     @staticmethod
-    def gtts_speak(text):
+    def gtts_speak(text, output_path=None):
         tts = gTTS(text=text, lang="en")
+        if output_path:
+            tts.save(output_path)
+            AIService._play_audio(output_path)
+            return output_path
         tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
         tmp.close()
         tts.save(tmp.name)
         AIService._play_audio(tmp.name)
         os.unlink(tmp.name)
+        return None
 
     @staticmethod
     def _play_audio(path):
@@ -595,23 +610,40 @@ class HospitalApp(ctk.CTk):
             # 2. Translate
             translated = AIService.translate(original, direction, lang_key)
 
-            # 3. Save & Display
-            self.after(0, self.update_transcript, role, original, translated)
+            # 3. Save per-utterance audio copy
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            rec_dir = PATIENTS_DIR / self.current_patient["id"] / "recordings"
+            rec_dir.mkdir(exist_ok=True)
+            utt_path = rec_dir / f"utt_{ts}_{role}.wav"
+            try:
+                shutil.copy(wav_path, utt_path)
+                audio_path_str = str(utt_path)
+            except Exception:
+                audio_path_str = None
 
-            # 4. Speak
+            # 4. Save & Display (including audio path if available)
+            self.after(0, self.update_transcript, role, original, translated, audio_path_str)
+
+            # 5. Speak and save translated TTS playback for both sides
+            tts_path = rec_dir / f"tts_{ts}_{role}.wav"
             if role == "doctor":
-                AIService.speak(translated, lang_key, is_indian=True)
+                saved_tts = AIService.sarvam_tts(translated, lang_key, output_path=str(tts_path))
             else:
-                AIService.speak(translated, "English", is_indian=False)
+                saved_tts = AIService.gtts_speak(translated, output_path=str(tts_path.with_suffix(".mp3")))
+
+            if saved_tts:
+                self.after(0, self._attach_translated_audio_to_last_entry, str(saved_tts))
 
         except Exception as e:
             self.after(0, lambda msg=str(e): self.chat_box.insert("end", f"\nError: {msg}\n"))
         finally:
             os.unlink(wav_path)
 
-    def update_transcript(self, role, original, translated):
+    def update_transcript(self, role, original, translated, audio_path=None):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         entry = {"role": role, "original": original, "translated": translated, "timestamp": timestamp}
+        if audio_path is not None:
+            entry["audio_path"] = audio_path
         
         # Save to JSON
         p_dir = PATIENTS_DIR / self.current_patient["id"]
@@ -626,6 +658,23 @@ class HospitalApp(ctk.CTk):
         # Display
         self.chat_box.insert("end", f"[{timestamp}] {role.upper()}\nIn: {original}\nOut: {translated}\n\n")
         self.chat_box.see("end")
+
+    def _attach_translated_audio_to_last_entry(self, translated_audio_path):
+        """
+        Store translated speech recording path on the latest transcript item.
+        """
+        p_dir = PATIENTS_DIR / self.current_patient["id"]
+        log_path = p_dir / "transcripts.json"
+        try:
+            with open(log_path, "r+") as f:
+                data = json.load(f)
+                if data:
+                    data[-1]["translated_audio_path"] = translated_audio_path
+                    f.seek(0)
+                    json.dump(data, f)
+                    f.truncate()
+        except Exception:
+            pass
 
     def open_pdf(self):
         ReportGenerator.update_pdf(self.current_patient["id"], self.current_patient["name"])
@@ -658,7 +707,8 @@ class HospitalApp(ctk.CTk):
         rec_dir = PATIENTS_DIR / self.current_patient["id"] / "recordings"
         if not rec_dir.exists(): return
         
-        files = list(rec_dir.glob("*.mp3"))
+        # Include both full-session and per-utterance recordings (wav/mp3)
+        files = list(rec_dir.glob("*.mp3")) + list(rec_dir.glob("*.wav"))
         if not files:
             messagebox.showinfo("Recordings", "No recordings found for this patient.")
             return
@@ -667,15 +717,31 @@ class HospitalApp(ctk.CTk):
         win.title("Past Recordings")
         win.geometry("400x300")
         
-        ctk.CTkLabel(win, text="Session Recordings", font=("Segoe UI", 16, "bold")).pack(pady=10)
+        ctk.CTkLabel(win, text="Session & Utterance Recordings", font=("Segoe UI", 16, "bold")).pack(pady=10)
         
         scroll = ctk.CTkScrollableFrame(win)
         scroll.pack(fill="both", expand=True, padx=10, pady=10)
         
         for f in sorted(files, reverse=True):
+            name = f.name
+            # Simple labeling: distinguish full sessions vs single utterances
+            if name.startswith("session_"):
+                label_text = f"Full session - {name}"
+            elif name.startswith("utt_"):
+                # Expected format: utt_YYYYmmdd_HHMMSS_role.ext
+                parts = name.split("_")
+                if len(parts) >= 3:
+                    ts_part = parts[1]
+                    role_part = parts[2].split(".")[0]  # role with extension removed
+                    label_text = f"Utterance ({role_part}) at {ts_part}"
+                else:
+                    label_text = f"Utterance - {name}"
+            else:
+                label_text = name
+
             f_frame = ctk.CTkFrame(scroll, fg_color="transparent")
             f_frame.pack(fill="x", pady=2)
-            ctk.CTkLabel(f_frame, text=f.name, font=("Segoe UI", 11)).pack(side="left")
+            ctk.CTkLabel(f_frame, text=label_text, font=("Segoe UI", 11)).pack(side="left")
             ctk.CTkButton(f_frame, text="▶ Play", width=50, height=24, command=lambda path=str(f): threading.Thread(target=AIService._play_audio, args=(path,), daemon=True).start()).pack(side="right")
             ctk.CTkButton(f_frame, text="📂 Open", width=50, height=24, command=lambda path=str(f): os.startfile(os.path.dirname(path))).pack(side="right", padx=5)
 
