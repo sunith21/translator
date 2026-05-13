@@ -1,7 +1,9 @@
 torch
 transformers
 sentencepiece
-openai-whisper
+faster-whisper
+silero-vad
+pyrnnoise
 sounddevice
 numpy
 scipy

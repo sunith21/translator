@@ -366,6 +366,16 @@ body {
 
 .msg-original, .msg-translated { margin: 0.2rem 0; font-size: 1.05rem; font-weight: 500; line-height: 1.5; }
 .msg-label { font-size: 0.8rem; color: var(--subtext); margin-right: 0.35rem; text-transform: uppercase; font-weight: 600; }
+.nmt-badge {
+  align-self: flex-start;
+  margin: 0.1rem 0 0;
+  padding: 0.18rem 0.5rem;
+  border: 1px solid var(--card-border);
+  border-radius: 4px;
+  color: var(--subtext);
+  font-size: 0.72rem;
+  font-weight: 600;
+}
 
 /* ── Status bar ── */
 .status-bar {
@@ -697,4 +707,3 @@ body {
 .archive-info { display: flex; align-items: center; gap: 0.65rem; }
 .archive-date { font-size: 0.875rem; font-weight: 500; }
 .archive-size { font-size: 0.75rem; color: var(--subtext); }
-

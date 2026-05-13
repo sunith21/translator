@@ -6,7 +6,7 @@ import tempfile
 import os
 from datetime import datetime
 import queue
-from medical_translation import translate_medical_text, warm_translation_models
+from medical_translation import describe_translation_engine, translate_medical_text, warm_translation_models
 
 # Load .env for SARVAM_API_KEY
 from dotenv import load_dotenv
@@ -328,7 +328,7 @@ class TranslatorApp(ctk.CTk):
                   command=self._show_history).pack(side="left", padx=6)
 
         # ── Status bar ──
-        self.status_var = ctk.StringVar(value="Ready.")
+        self.status_var = ctk.StringVar(value=describe_translation_engine())
         ctk.CTkLabel(outer, textvariable=self.status_var, font=("Segoe UI", 12),
                  text_color="gray", anchor="w").grid(row=4, column=0,
                                                       sticky="ew", pady=(0, 4))
@@ -439,7 +439,7 @@ class TranslatorApp(ctk.CTk):
             return
 
         self.translate_btn.configure(state="disabled", text="Translating…")
-        self.status_var.set("⏳  Loading model and translating…")
+        self.status_var.set("Loading NMT model and translating full sentence meaning...")
 
         lang_key  = self.lang_var.get()
         direction = self._direction
@@ -460,7 +460,7 @@ class TranslatorApp(ctk.CTk):
         self._set_output(result, font)
         lang = lang_key.split("(")[0].strip()
         arrow = f"English → {lang}" if direction == "en_to_native" else f"{lang} → English"
-        self.status_var.set(f"✔  {arrow} done.")
+        self.status_var.set(f"NMT complete: {arrow}.")
         self.translate_btn.configure(state="normal", text="Translate  ➜")
         self.history.insert(0, {
             "ts":    datetime.now().strftime("%H:%M:%S"),

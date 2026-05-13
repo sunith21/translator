@@ -26,7 +26,16 @@ _LANGUAGE_ALIASES = {
     "Konkani (कोंकणी)": "Konkani (कोंकणी)",
     "Konkani (à¤•à¥‹à¤‚à¤•à¤£à¥€)": "Konkani (कोंकणी)",
 }
-NLLB_MODEL_NAME = "facebook/nllb-200-distilled-600M"
+# Override with NLLB_MODEL_NAME in the environment for quality vs. speed (e.g. facebook/nllb-200-1.3B).
+NLLB_MODEL_NAME = os.environ.get(
+    "NLLB_MODEL_NAME",
+    "facebook/nllb-200-distilled-600M",
+)
+NMT_ENGINE_NAME = "NLLB-200 offline NMT"
+NMT_ENGINE_SUMMARY = (
+    "NLLB-200 offline NMT: translates complete sentence meaning locally after model download, "
+    "preserving medical terms, dosage values, and grammar context."
+)
 NLLB_LANGUAGE_CODES = {
     "Hindi (हिन्दी)": "hin_Deva",
     "Kannada (ಕನ್ನಡ)": "kan_Knda",
@@ -40,6 +49,8 @@ NLLB_LANGUAGE_CODES = {
 _DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 _MODEL_CACHE: dict[str, dict[str, Any]] = {}
 _MODEL_LOCK = threading.Lock()
+_SESSION_WARM_LOCK = threading.Lock()
+_warmed_session_keys: set[tuple[str, str]] = set()
 _TRANSLATION_CACHE: "OrderedDict[object, str]" = OrderedDict()
 _CACHE_LOCK = threading.Lock()
 _TRANSLATION_CACHE_MAX = 4096
@@ -178,6 +189,7 @@ def _split_long_fragment(fragment: str, limit: int) -> list[str]:
 
 
 def _chunk_text(text: str, limit: int = 260) -> list[str]:
+    """Build sentence-level chunks so the model translates meaning, not isolated words."""
     normalized = _normalize_text(text)
     if not normalized:
         return []
@@ -244,7 +256,7 @@ def _generate_batch(tokenizer, model, inputs, forced_bos_token_id: int | None = 
 
     generation_kwargs = {
         "max_new_tokens": 256,
-        "num_beams": 3,
+        "num_beams": max(1, int(os.environ.get("NLLB_NUM_BEAMS", "3"))),
         "early_stopping": True,
         "no_repeat_ngram_size": 3,
         "repetition_penalty": 1.05,
@@ -303,19 +315,26 @@ def get_nllb_code(lang_key: str) -> str:
     return NLLB_LANGUAGE_CODES.get(normalized_lang, "hin_Deva")
 
 
-def warm_translation_models(direction: str, lang_key: str) -> None:
-    normalized_lang = _LANGUAGE_ALIASES.get(lang_key, lang_key)
-    if direction == "en_to_native":
-        if normalized_lang == HINDI_KEY:
-            _get_marian("Helsinki-NLP/opus-mt-en-hi")
-        else:
-            _get_nllb()
-        return
+def describe_translation_engine(lang_key: str | None = None) -> str:
+    if lang_key:
+        return f"{NMT_ENGINE_NAME} - NLLB multilingual sentence model"
+    return NMT_ENGINE_SUMMARY
 
-    if normalized_lang == HINDI_KEY:
-        _get_marian("Helsinki-NLP/opus-mt-hi-en")
-    else:
-        _get_nllb()
+
+def warm_translation_models(direction: str, lang_key: str) -> None:
+    _get_nllb()
+
+
+def ensure_session_models(doctor_lang_key: str, patient_lang_key: str) -> None:
+    """Load NLLB-200 once per unique doctor/patient language pair."""
+    dk = _LANGUAGE_ALIASES.get(doctor_lang_key, doctor_lang_key)
+    pk = _LANGUAGE_ALIASES.get(patient_lang_key, patient_lang_key)
+    key = (dk, pk)
+    with _SESSION_WARM_LOCK:
+        if key in _warmed_session_keys:
+            return
+        _warmed_session_keys.add(key)
+    _get_nllb()
 
 
 def translate_medical_text(text: str, direction: str, lang_key: str) -> str:
@@ -333,16 +352,42 @@ def translate_medical_text(text: str, direction: str, lang_key: str) -> str:
     chunks = _chunk_text(protected_text)
 
     if direction == "en_to_native":
-        if normalized_lang == HINDI_KEY:
-            translated_chunks = _translate_marian_chunks(chunks, "Helsinki-NLP/opus-mt-en-hi")
-        else:
-            translated_chunks = _translate_nllb_chunks(chunks, "eng_Latn", get_nllb_code(normalized_lang))
+        translated_chunks = _translate_nllb_chunks(chunks, "eng_Latn", get_nllb_code(normalized_lang))
     else:
-        if normalized_lang == HINDI_KEY:
-            translated_chunks = _translate_marian_chunks(chunks, "Helsinki-NLP/opus-mt-hi-en")
-        else:
-            translated_chunks = _translate_nllb_chunks(chunks, get_nllb_code(normalized_lang), "eng_Latn")
+        translated_chunks = _translate_nllb_chunks(chunks, get_nllb_code(normalized_lang), "eng_Latn")
 
     translated = _restore_medical_terms(" ".join(chunk for chunk in translated_chunks if chunk), replacements)
+    _cache_set(cache_key, translated)
+    return translated
+
+
+def translate_medical_native_pair(text: str, source_lang_key: str, target_lang_key: str) -> str:
+    """
+    Single NLLB pass between two consultation languages (no English pivot).
+    Improves accuracy and halves MT latency vs. native→English→native.
+    """
+    if source_lang_key == "English" or target_lang_key == "English":
+        raise ValueError(
+            "translate_medical_native_pair does not support English; use translate_medical_text."
+        )
+    normalized = _normalize_text(text)
+    if not normalized:
+        return ""
+    src_key = _LANGUAGE_ALIASES.get(source_lang_key, source_lang_key)
+    tgt_key = _LANGUAGE_ALIASES.get(target_lang_key, target_lang_key)
+    if src_key == tgt_key:
+        return normalized
+
+    cache_key = ("native_pair", normalized, src_key, tgt_key)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    protected_text, replacements = _protect_medical_terms(normalized)
+    chunks = _chunk_text(protected_text)
+    src_code = get_nllb_code(src_key)
+    tgt_code = get_nllb_code(tgt_key)
+    translated_chunks = _translate_nllb_chunks(chunks, src_code, tgt_code)
+    translated = _restore_medical_terms(" ".join(c for c in translated_chunks if c), replacements)
     _cache_set(cache_key, translated)
     return translated

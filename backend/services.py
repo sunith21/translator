@@ -5,22 +5,45 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 import requests
-import whisper
 import numpy as np
 import scipy.io.wavfile as wav
 from fpdf import FPDF
 from pydub import AudioSegment
-from medical_translation import translate_medical_text
+from medical_translation import translate_medical_native_pair, translate_medical_text
+from backend.audio_pipeline import load_wav_float32
 
 # ─────────────────────────────────────────────
 #  Lazy Model Cache
 # ─────────────────────────────────────────────
 _MODEL_CACHE = {}
 
-def get_whisper(size="base"):
-    if f"whisper_{size}" not in _MODEL_CACHE:
-        _MODEL_CACHE[f"whisper_{size}"] = whisper.load_model(size)
-    return _MODEL_CACHE[f"whisper_{size}"]
+FASTER_WHISPER_MODEL = os.environ.get("FASTER_WHISPER_MODEL", "medium")
+FASTER_WHISPER_DEVICE = os.environ.get("FASTER_WHISPER_DEVICE", "auto")
+FASTER_WHISPER_COMPUTE_TYPE = os.environ.get("FASTER_WHISPER_COMPUTE_TYPE", "auto")
+FASTER_WHISPER_CPU_THREADS = int(
+    os.environ.get("FASTER_WHISPER_CPU_THREADS", str(max(1, min(8, os.cpu_count() or 1))))
+)
+
+def get_whisper(size: str | None = None):
+    model_size = size or FASTER_WHISPER_MODEL
+    key = f"faster_whisper_{model_size}_{FASTER_WHISPER_DEVICE}_{FASTER_WHISPER_COMPUTE_TYPE}"
+    if key not in _MODEL_CACHE:
+        from faster_whisper import WhisperModel
+        _MODEL_CACHE[key] = WhisperModel(
+            model_size,
+            device=FASTER_WHISPER_DEVICE,
+            compute_type=FASTER_WHISPER_COMPUTE_TYPE,
+            cpu_threads=FASTER_WHISPER_CPU_THREADS,
+        )
+    return _MODEL_CACHE[key]
+
+
+def _get_openai_whisper(size: str = "base"):
+    key = f"openai_whisper_{size}"
+    if key not in _MODEL_CACHE:
+        import whisper
+        _MODEL_CACHE[key] = whisper.load_model(size)
+    return _MODEL_CACHE[key]
 
 # ─────────────────────────────────────────────
 #  Constants
@@ -97,6 +120,17 @@ class PatientManager:
     def update_last_visit(self, patient_id):
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("UPDATE patients SET last_visit = ? WHERE id = ?", (datetime.now(), patient_id))
+
+    def get_transcripts(self, patient_id: str) -> list[dict]:
+        log_path = PATIENTS_DIR / patient_id / "transcripts.json"
+        if not log_path.exists():
+            return []
+        try:
+            with open(log_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
 
 # ─────────────────────────────────────────────
 #  Email Service
@@ -212,19 +246,56 @@ stomach pain, headache, breathing difficulty, swelling
 
 Return ONLY the corrected transcript text with no extra commentary."""
 
+    _MEDICAL_STT_PROMPT = """Medical consultation transcript. Preserve exact symptoms, diagnoses, medicines, dosages, measurements, dates, durations, and body parts.
+Common terms: fever, cough, cold, chest pain, breathing difficulty, wheezing, dizziness, nausea, vomiting, diarrhea, stomach pain, headache, weakness, swelling, allergy, infection, diabetes, hypertension, asthma, migraine, ECG, MRI, CT scan, X-ray, HbA1c, blood pressure, SpO2, paracetamol, ibuprofen, amoxicillin, azithromycin, metformin, insulin, amlodipine, telmisartan, atorvastatin, pantoprazole, omeprazole, salbutamol."""
+
     @staticmethod
-    def correct_transcript(text: str) -> str:
+    def build_conversation_context(patient_id: str | None, limit: int = 8) -> str:
+        if not patient_id:
+            return ""
+        transcripts = PatientManager().get_transcripts(patient_id)[-limit:]
+        lines = []
+        for entry in transcripts:
+            role = (entry.get("role") or "speaker").capitalize()
+            original = (entry.get("original") or "").strip()
+            translated = (entry.get("translated") or "").strip()
+            if original:
+                lines.append(f"{role}: {original}")
+            if translated and translated != original:
+                lines.append(f"{role} translated: {translated}")
+        return "\n".join(lines)[-1800:]
+
+    @staticmethod
+    def build_medical_stt_prompt(patient_id: str | None = None, role: str | None = None) -> str:
+        parts = [AIService._MEDICAL_STT_PROMPT]
+        if role:
+            parts.append(f"Current speaker role: {role}.")
+        context = AIService.build_conversation_context(patient_id)
+        if context:
+            parts.append("Recent conversation memory:\n" + context)
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def correct_transcript(text: str, patient_id: str | None = None, role: str | None = None) -> str:
         """Send STT text through Sarvam's LLM for medical transcription correction."""
         api_key = os.environ.get("SARVAM_API_KEY", "")
         if not api_key:
             print("[correct_transcript] No SARVAM_API_KEY — skipping correction.")
             return text
         try:
+            context = AIService.build_conversation_context(patient_id)
+            user_content = f'"""\n{text}\n"""'
+            if context:
+                speaker = f" for the {role}" if role else ""
+                user_content = (
+                    f"Recent consultation memory{speaker}:\n{context}\n\n"
+                    f"Correct this newest transcript only:\n{user_content}"
+                )
             payload = {
                 "model": "sarvam-m",
                 "messages": [
                     {"role": "system", "content": AIService._CORRECTION_SYSTEM_PROMPT},
-                    {"role": "user",   "content": f'"""\n{text}\n"""'}
+                    {"role": "user",   "content": user_content}
                 ],
                 "temperature": 0.1,
                 "max_tokens": 512,
@@ -249,66 +320,17 @@ Return ONLY the corrected transcript text with no extra commentary."""
             print(f"[correct_transcript] failed: {e} — using original text")
             return text
 
-
-    @staticmethod
-    def translate(text, direction, lang_key):
-        cache_key = (text or "", direction or "", lang_key or "")
-        if cache_key in _TRANSLATION_CACHE:
-            return _TRANSLATION_CACHE[cache_key]
-        try:
-            if direction == "en_to_native":
-                if lang_key == "Hindi (हिन्दी)":
-                    res = AIService._translate_marian(text, "Helsinki-NLP/opus-mt-en-hi")
-                else:
-                    tgt = AIService._get_nllb_code(lang_key)
-                    res = AIService._translate_nllb(text, "eng_Latn", tgt)
-            else:
-                if lang_key == "Hindi (हिन्दी)":
-                    res = AIService._translate_marian(text, "Helsinki-NLP/opus-mt-hi-en")
-                else:
-                    src = AIService._get_nllb_code(lang_key)
-                    res = AIService._translate_nllb(text, src, "eng_Latn")
-            _TRANSLATION_CACHE[cache_key] = res
-            if len(_TRANSLATION_CACHE) > _TRANSLATION_CACHE_MAX:
-                _TRANSLATION_CACHE.pop(next(iter(_TRANSLATION_CACHE)))
-            return res
-        except Exception as e:
-            return f"Error: {str(e)}"
-
-    @staticmethod
-    def _translate_marian(text, model_name):
-        cache = get_marian(model_name)
-        inputs = cache["tokenizer"]([text], return_tensors="pt", padding=True, truncation=True, max_length=512)
-        with torch.no_grad():
-            tokens = cache["model"].generate(**inputs, max_length=512)
-        return cache["tokenizer"].decode(tokens[0], skip_special_tokens=True)
-
-    @staticmethod
-    def _translate_nllb(text, src, tgt):
-        cache = get_nllb()
-        cache["tokenizer"].src_lang = src
-        inputs = cache["tokenizer"](text, return_tensors="pt", truncation=True, max_length=512)
-        bos_id = cache["tokenizer"].convert_tokens_to_ids(tgt)
-        with torch.no_grad():
-            tokens = cache["model"].generate(**inputs, forced_bos_token_id=bos_id, max_length=512)
-        return cache["tokenizer"].decode(tokens[0], skip_special_tokens=True)
-
-    @staticmethod
-    def _get_nllb_code(lang_key):
-        codes = {
-            "Kannada (ಕನ್ನಡ)": "kan_Knda",
-            "Marathi (मराठी)": "mar_Deva",
-            "Bengali (বাংলা)": "ben_Beng",
-            "Malayalam (മലയാളം)": "mal_Mlym",
-            "Tamil (தமிழ்)": "tam_Taml",
-            "Konkani (कोंकणी)": "mar_Deva"  # Fallback to Marathi as NLLB lacks Konkani
-        }
-        return codes.get(lang_key, "hin_Deva")
-
     @staticmethod
     def translate(text, direction, lang_key):
         try:
             return translate_medical_text(text, direction, lang_key)
+        except Exception as e:
+            return f"Error: {str(e)}"
+
+    @staticmethod
+    def translate_native_pair(text: str, source_lang_key: str, target_lang_key: str) -> str:
+        try:
+            return translate_medical_native_pair(text, source_lang_key, target_lang_key)
         except Exception as e:
             return f"Error: {str(e)}"
 
@@ -328,47 +350,76 @@ Return ONLY the corrected transcript text with no extra commentary."""
     @staticmethod
     def _load_audio_float32(wav_path):
         """Load a WAV file and return a mono float32 numpy array at 16 kHz."""
-        import scipy.io.wavfile as wavfile
-        sample_rate, audio = wavfile.read(wav_path)
-        if audio.dtype == np.int16:
-            audio = audio.astype(np.float32) / 32768.0
-        elif audio.dtype == np.int32:
-            audio = audio.astype(np.float32) / 2147483648.0
-        elif audio.dtype != np.float32:
-            audio = audio.astype(np.float32)
-        if audio.ndim > 1:
-            audio = audio.mean(axis=1)
-        if sample_rate != 16000:
-            import scipy.signal as signal
-            num_samples = int(len(audio) * 16000 / sample_rate)
-            audio = signal.resample(audio, num_samples)
+        _, audio = load_wav_float32(wav_path)
         return audio
 
     @staticmethod
-    def detect_language(wav_path) -> str:
-        """Use Whisper to detect the spoken language. Returns an ISO-639-1 code, e.g. 'hi', 'en', 'ta'."""
-        wmodel = get_whisper("base")
+    def detect_language_probs(wav_path) -> dict:
+        """
+        Faster-Whisper language-id confidence used for auto speaker detection.
+        """
         audio = AIService._load_audio_float32(wav_path)
-        # Whisper.detect_language needs a padded/trimmed 30-second mel
-        audio_padded = whisper.pad_or_trim(audio)
-        mel = whisper.log_mel_spectrogram(audio_padded).to(wmodel.device)
-        _, probs = wmodel.detect_language(mel)
+        try:
+            wmodel = get_whisper()
+            segments, info = wmodel.transcribe(
+                audio,
+                beam_size=1,
+                language=None,
+                task="transcribe",
+                initial_prompt=AIService._MEDICAL_STT_PROMPT,
+                vad_filter=False,
+            )
+            for _ in segments:
+                break
+            lang = getattr(info, "language", None) or "en"
+            prob = float(getattr(info, "language_probability", 0.0) or 0.0)
+            return {lang: prob}
+        except Exception as faster_err:
+            print(f"[Faster-Whisper language detection failed, using openai-whisper fallback]: {faster_err}")
+            import whisper
+            wmodel = _get_openai_whisper("base")
+            audio_padded = whisper.pad_or_trim(audio)
+            mel = whisper.log_mel_spectrogram(audio_padded).to(wmodel.device)
+            _, probs = wmodel.detect_language(mel)
+            return dict(probs)
+
+    @staticmethod
+    def detect_language(wav_path) -> str:
+        """Use Faster-Whisper to detect the spoken language. Returns an ISO-639-1 code."""
+        probs = AIService.detect_language_probs(wav_path)
         detected = max(probs, key=probs.get)
         confidence = probs[detected]
         print(f"[Language detection] {detected} ({confidence:.2%})")
         return detected
 
     @staticmethod
-    def whisper_stt(wav_path, lang_code=None):
+    def whisper_stt(wav_path, lang_code=None, patient_id: str | None = None, role: str | None = None):
         """Transcribe using Whisper with scipy audio loading — no ffmpeg required.
         lang_code=None means Whisper auto-detects the language."""
-        wmodel = get_whisper("base")
         audio = AIService._load_audio_float32(wav_path)
-        kwargs = {"fp16": False}
-        if lang_code:
-            kwargs["language"] = lang_code
-        res = wmodel.transcribe(audio, **kwargs)
-        return res["text"].strip()
+        prompt = AIService.build_medical_stt_prompt(patient_id, role)
+        try:
+            wmodel = get_whisper()
+            segments, _ = wmodel.transcribe(
+                audio,
+                language=lang_code,
+                task="transcribe",
+                beam_size=int(os.environ.get("FASTER_WHISPER_BEAM_SIZE", "5")),
+                best_of=int(os.environ.get("FASTER_WHISPER_BEST_OF", "5")),
+                temperature=float(os.environ.get("FASTER_WHISPER_TEMPERATURE", "0")),
+                condition_on_previous_text=True,
+                initial_prompt=prompt,
+                vad_filter=False,
+            )
+            return " ".join(seg.text.strip() for seg in segments if seg.text).strip()
+        except Exception as faster_err:
+            print(f"[Faster-Whisper STT failed, using openai-whisper fallback]: {faster_err}")
+            wmodel = _get_openai_whisper(os.environ.get("OPENAI_WHISPER_FALLBACK_MODEL", "base"))
+            kwargs = {"fp16": False, "task": "transcribe", "initial_prompt": prompt}
+            if lang_code:
+                kwargs["language"] = lang_code
+            res = wmodel.transcribe(audio, **kwargs)
+            return res.get("text", "").strip()
 
     @staticmethod
     def is_language_consistent(text: str, lang_key: str) -> bool:

@@ -16,14 +16,16 @@ from fpdf import FPDF
 from pydub import AudioSegment
 import requests
 import whisper
-import torch
 import sounddevice as sd
 import numpy as np
 import scipy.io.wavfile as wav
-from transformers import MarianMTModel, MarianTokenizer, AutoModelForSeq2SeqLM, AutoTokenizer
 from gtts import gTTS
 import pygame
-from medical_translation import translate_medical_text
+from medical_translation import (
+    describe_translation_engine,
+    translate_medical_native_pair,
+    translate_medical_text,
+)
 
 # Load environment variables
 load_dotenv()
@@ -37,23 +39,6 @@ def get_whisper(size="base"):
     if f"whisper_{size}" not in _MODEL_CACHE:
         _MODEL_CACHE[f"whisper_{size}"] = whisper.load_model(size)
     return _MODEL_CACHE[f"whisper_{size}"]
-
-def get_marian(model_name):
-    if model_name not in _MODEL_CACHE:
-        _MODEL_CACHE[model_name] = {
-            "tokenizer": MarianTokenizer.from_pretrained(model_name),
-            "model": MarianMTModel.from_pretrained(model_name),
-        }
-    return _MODEL_CACHE[model_name]
-
-def get_nllb():
-    model_name = "facebook/nllb-200-distilled-600M"
-    if model_name not in _MODEL_CACHE:
-        _MODEL_CACHE[model_name] = {
-            "tokenizer": AutoTokenizer.from_pretrained(model_name, use_fast=False),
-            "model": AutoModelForSeq2SeqLM.from_pretrained(model_name),
-        }
-    return _MODEL_CACHE[model_name]
 
 # ─────────────────────────────────────────────
 #  Constants & Configuration
@@ -228,57 +213,15 @@ class AIService:
 
     @staticmethod
     def translate(text, direction, lang_key):
-        # direction: "en_to_native" or "native_to_en"
-        # For simplicity, using same logic as translator.py
         try:
-            if direction == "en_to_native":
-                if lang_key == "Hindi (हिन्दी)":
-                    res = AIService._translate_marian(text, "Helsinki-NLP/opus-mt-en-hi")
-                else:
-                    # Default to NLLB for others
-                    tgt = AIService._get_nllb_code(lang_key)
-                    res = AIService._translate_nllb(text, "eng_Latn", tgt)
-            else:
-                if lang_key == "Hindi (हिन्दी)":
-                    res = AIService._translate_marian(text, "Helsinki-NLP/opus-mt-hi-en")
-                else:
-                    src = AIService._get_nllb_code(lang_key)
-                    res = AIService._translate_nllb(text, src, "eng_Latn")
-            return res
+            return translate_medical_text(text, direction, lang_key)
         except Exception as e:
             return f"Error: {str(e)}"
 
     @staticmethod
-    def _translate_marian(text, model_name):
-        cache = get_marian(model_name)
-        inputs = cache["tokenizer"]([text], return_tensors="pt", padding=True, truncation=True, max_length=512)
-        with torch.no_grad():
-            tokens = cache["model"].generate(**inputs, max_length=512)
-        return cache["tokenizer"].decode(tokens[0], skip_special_tokens=True)
-
-    @staticmethod
-    def _translate_nllb(text, src, tgt):
-        cache = get_nllb()
-        cache["tokenizer"].src_lang = src
-        inputs = cache["tokenizer"](text, return_tensors="pt", truncation=True, max_length=512)
-        bos_id = cache["tokenizer"].convert_tokens_to_ids(tgt)
-        with torch.no_grad():
-            tokens = cache["model"].generate(**inputs, forced_bos_token_id=bos_id, max_length=512)
-        return cache["tokenizer"].decode(tokens[0], skip_special_tokens=True)
-
-    @staticmethod
-    def _get_nllb_code(lang_key):
-        codes = {
-            "Kannada (ಕನ್ನಡ)": "kan_Knda",
-            "Marathi (मराठी)": "mar_Deva",
-            "Bengali (বাংলা)": "ben_Beng"
-        }
-        return codes.get(lang_key, "hin_Deva")
-
-    @staticmethod
-    def translate(text, direction, lang_key):
+    def translate_native_pair(text: str, source_lang_key: str, target_lang_key: str) -> str:
         try:
-            return translate_medical_text(text, direction, lang_key)
+            return translate_medical_native_pair(text, source_lang_key, target_lang_key)
         except Exception as e:
             return f"Error: {str(e)}"
 
@@ -544,6 +487,13 @@ class HospitalApp(ctk.CTk):
         hist = ctk.CTkFrame(split, width=300, fg_color=CARD_COLOR, corner_radius=10)
         hist.pack(side="right", fill="y")
         ctk.CTkLabel(hist, text="Session Info", font=("Segoe UI", 14, "bold")).pack(pady=10)
+        ctk.CTkLabel(
+            hist,
+            text=describe_translation_engine(self.lang_var.get()),
+            text_color=SUBTEXT_COLOR,
+            wraplength=260,
+            justify="left",
+        ).pack(pady=(0, 10), padx=20, fill="x")
         ctk.CTkButton(hist, text="Open Patient PDF", fg_color="transparent", border_width=1, command=self.open_pdf).pack(pady=5, padx=20, fill="x")
         ctk.CTkButton(hist, text="View Past Recordings", fg_color="transparent", border_width=1, command=self._view_recordings).pack(pady=5, padx=20, fill="x")
         ctk.CTkButton(hist, text="Send via WhatsApp (API)", fg_color="#25D366", text_color="white", command=self.send_pdf_whatsapp).pack(pady=5, padx=20, fill="x")
@@ -616,6 +566,7 @@ class HospitalApp(ctk.CTk):
                 direction = "native_to_en"
 
             # 2. Translate
+            self.after(0, lambda: self.chat_box.insert("end", "\nNMT: translating full sentence meaning...\n"))
             translated = AIService.translate(original, direction, lang_key)
 
             # 3. Save per-utterance audio copy

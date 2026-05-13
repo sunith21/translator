@@ -8,6 +8,8 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from datetime import datetime
 from dotenv import load_dotenv
+from medical_translation import describe_translation_engine, ensure_session_models
+from backend.audio_pipeline import prepare_audio_for_stt
 from backend.services import PatientManager, AIService, ReportGenerator, EmailService
 
 # Load .env so SARVAM_API_KEY is available
@@ -42,17 +44,26 @@ class TranscriptEntry(BaseModel):
     role: str
     original: str
     translated: str
+    translation_engine: Optional[str] = None
     audio_filename: Optional[str] = None
     translated_audio_filename: Optional[str] = None
     stt_confidence: Optional[float] = None
     low_confidence: Optional[bool] = None
     stt_engine: Optional[str] = None
+    audio_enhancement: Optional[dict] = None
 
 class PDFRequest(BaseModel):
     transcripts: list = None
 
 class CorrectionRequest(BaseModel):
     text: str
+
+class TextChatRequest(BaseModel):
+    patient_id: str
+    text: str
+    role: str = "patient"
+    lang_key: str
+    doctor_lang_key: str = "English"
 
 class TTSClipRequest(BaseModel):
     text: str
@@ -88,11 +99,58 @@ def _score_stt_quality(text: str, lang_key: str, script_consistent: bool, retrie
     score = max(0.0, min(0.99, score))
     return score, (score < 0.60)
 
-def _is_allowed_detected_language(detected_code: str, doctor_code: str, patient_code: str) -> bool:
+def _normalize_whisper_detect_code(code: str, doctor_code: str, patient_code: str) -> str:
+    """Konkani is often detected as Marathi by Whisper."""
+    if code == "mr" and (patient_code == "gom" or doctor_code == "gom"):
+        return "gom"
+    return code
+
+
+def _resolve_auto_role_from_probs(
+    lang_probs: dict,
+    doctor_code: str,
+    patient_code: str,
+) -> tuple[Optional[str], str, float]:
     """
-    Accept only doctor/patient languages in auto mode.
+    Pick doctor vs patient from Whisper language-id probabilities.
+    Returns (role, top_detected_code, top_probability). role is None only when we should ignore
+    the utterance (confident detection of a language outside the consultation pair).
     """
-    return detected_code in {doctor_code, patient_code}
+    if not lang_probs:
+        return "patient", "en", 0.0
+
+    ranked = sorted(lang_probs.items(), key=lambda kv: -kv[1])
+    top_lang, top_p = ranked[0]
+
+    if doctor_code == patient_code:
+        return "patient", top_lang, float(top_p)
+
+    doctor_best = 0.0
+    patient_best = 0.0
+    for lang, p in ranked:
+        n = _normalize_whisper_detect_code(str(lang), doctor_code, patient_code)
+        p = float(p)
+        if n == doctor_code:
+            doctor_best = max(doctor_best, p)
+        if n == patient_code:
+            patient_best = max(patient_best, p)
+
+    if doctor_best > 0 or patient_best > 0:
+        if doctor_best > patient_best:
+            return "doctor", top_lang, float(top_p)
+        if patient_best > doctor_best:
+            return "patient", top_lang, float(top_p)
+        n_top = _normalize_whisper_detect_code(str(top_lang), doctor_code, patient_code)
+        if n_top == doctor_code:
+            return "doctor", top_lang, float(top_p)
+        if n_top == patient_code:
+            return "patient", top_lang, float(top_p)
+        return "patient", top_lang, float(top_p)
+
+    if top_p < 0.55:
+        return "patient", top_lang, float(top_p)
+
+    return None, top_lang, float(top_p)
 
 @app.get("/patients/recent")
 async def get_recent_patients():
@@ -145,9 +203,15 @@ async def clear_chat(patient_id: str):
 @app.post("/translate")
 async def translate(req: TranslationRequest):
     if req.lang_key == "English":
-        return {"translated": req.text}
+        return {
+            "translated": req.text,
+            "translation_engine": "No machine translation needed",
+        }
     result = ai.translate(req.text, req.direction, req.lang_key)
-    return {"translated": result}
+    return {
+        "translated": result,
+        "translation_engine": describe_translation_engine(req.lang_key),
+    }
 
 @app.post("/stt")
 async def speech_to_text(
@@ -169,7 +233,18 @@ async def speech_to_text(
     with open(temp_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
+    processed_audio = None
+    stt_path = temp_path
     try:
+        processed_audio = prepare_audio_for_stt(temp_path)
+        stt_path = processed_audio.path
+        audio_enhancement = {
+            "rnnoise_applied": processed_audio.rnnoise_applied,
+            "silero_vad_applied": processed_audio.vad_applied,
+            "duration_seconds": round(processed_audio.duration_seconds, 2),
+            "speech_seconds": round(processed_audio.speech_seconds, 2),
+        }
+        ensure_session_models(doctor_lang_key, lang_key)
         # Sarvam uses BCP-47 codes (hi-IN), Whisper uses ISO 639-1 (hi)
         sarvam_lang_codes = {
             "Hindi (हिन्दी)":   "hi-IN",
@@ -194,122 +269,116 @@ async def speech_to_text(
 
         # ── Auto-detect speaker from spoken language ──────────────────────────
         if role == "auto":
-            detected_code = ai.detect_language(temp_path)
-            doctor_code   = whisper_lang_codes.get(doctor_lang_key, "en")
-            patient_code  = whisper_lang_codes.get(lang_key, "hi")
-
-            # Konkani is often detected as Marathi by Whisper — correct for it
-            if detected_code == "mr" and patient_code == "gom":
-                detected_code = "gom"
-            if detected_code == "mr" and doctor_code == "gom":
-                detected_code = "gom"
-
-            if detected_code == doctor_code:
-                role = "doctor"
-            elif detected_code == patient_code:
-                role = "patient"
-            else:
-                # Ignore out-of-scope language so random speech does not interfere.
-                if not _is_allowed_detected_language(detected_code, doctor_code, patient_code):
-                    print(
-                        f"[Auto-detect] ignoring utterance; detected '{detected_code}' "
-                        f"not in allowed set (doctor='{doctor_code}', patient='{patient_code}')"
-                    )
-                    return {
-                        "ignored": True,
-                        "reason": "Detected a third language not selected for this consultation.",
-                        "detected_language": detected_code,
-                    }
-                # Ambiguous fallback (should be rare after allowed-language gate).
-                role = "patient"
-            print(f"[Auto-detect] resolved role → {role}")
+            doctor_code = whisper_lang_codes.get(doctor_lang_key, "en")
+            patient_code = whisper_lang_codes.get(lang_key, "hi")
+            lang_probs = ai.detect_language_probs(stt_path)
+            resolved, det_top, det_p = _resolve_auto_role_from_probs(
+                lang_probs, doctor_code, patient_code
+            )
+            if resolved is None:
+                print(
+                    f"[Auto-detect] ignoring utterance; no doctor/patient match in Whisper "
+                    f"language scores (doctor='{doctor_code}', patient='{patient_code}', "
+                    f"top='{det_top}' {det_p:.0%})"
+                )
+                return {
+                    "ignored": True,
+                    "reason": "Detected a third language not selected for this consultation.",
+                    "detected_language": det_top,
+                    "audio_enhancement": audio_enhancement,
+                }
+            role = resolved
+            print(f"[Auto-detect] resolved role → {role} (Whisper top={det_top} {det_p:.0%})")
         # ─────────────────────────────────────────────────────────────────────
 
         if role == "doctor":
             # Transcribe doctor in their chosen language
-            stt_engine = "whisper"
+            stt_engine = f"faster-whisper-{os.environ.get('FASTER_WHISPER_MODEL', 'medium')}+"
             stt_retried = False
             if doctor_lang_key == "English":
-                original = ai.whisper_stt(temp_path, "en")
+                original = ai.whisper_stt(stt_path, "en", patient_id, role)
             else:
+                forced_lang = whisper_lang_codes.get(doctor_lang_key, "en")
                 try:
-                    original = ai.sarvam_stt(temp_path, sarvam_lang_codes.get(doctor_lang_key, "hi-IN"))
-                    stt_engine = "sarvam"
-                except Exception as sarvam_err:
-                    print(f"[Sarvam STT failed for doctor, falling back to Whisper]: {sarvam_err}")
-                    original = ai.whisper_stt(temp_path, whisper_lang_codes.get(doctor_lang_key, "en"))
-                    stt_engine = "whisper_fallback"
+                    original = ai.whisper_stt(stt_path, forced_lang, patient_id, role)
+                except Exception as whisper_err:
+                    print(f"[Faster-Whisper STT failed for doctor, trying Sarvam fallback]: {whisper_err}")
+                    original = ai.sarvam_stt(stt_path, sarvam_lang_codes.get(doctor_lang_key, "hi-IN"))
+                    stt_engine = "sarvam_fallback"
 
                 # If script looks mismatched (wrong language), retry Whisper with forced language.
                 if not ai.is_language_consistent(original, doctor_lang_key):
-                    forced_lang = whisper_lang_codes.get(doctor_lang_key, "en")
-                    print(f"[STT language mismatch] doctor transcript didn't match {doctor_lang_key}; retrying Whisper ({forced_lang})")
-                    original = ai.whisper_stt(temp_path, forced_lang)
+                    print(f"[STT language mismatch] doctor transcript didn't match {doctor_lang_key}; retrying Faster-Whisper ({forced_lang})")
+                    original = ai.whisper_stt(stt_path, forced_lang, patient_id, role)
                     stt_retried = True
-                    stt_engine = "whisper_forced_retry"
+                    stt_engine = "faster-whisper_forced_retry"
 
             script_ok = ai.is_language_consistent(original, doctor_lang_key)
             stt_confidence, low_confidence = _score_stt_quality(
                 original, doctor_lang_key, script_ok, stt_retried, stt_engine
             )
-            original = ai.correct_transcript(original)
+            original = ai.correct_transcript(original, patient_id, role)
 
             # Translate: doctor_lang → patient_lang
             # If both are the same, no translation needed
             if doctor_lang_key == lang_key:
                 translated = original
+                translation_engine = "No machine translation needed"
             elif doctor_lang_key == "English" and lang_key != "English":
                 # English → native patient language
                 translated = ai.translate(original, "en_to_native", lang_key)
+                translation_engine = describe_translation_engine(lang_key)
             elif doctor_lang_key != "English" and lang_key == "English":
                 # Native doctor language → English
                 translated = ai.translate(original, "native_to_en", doctor_lang_key)
+                translation_engine = describe_translation_engine(doctor_lang_key)
             else:
-                # Native language A → English → Native language B (pivot translation)
-                english_pivot = ai.translate(original, "native_to_en", doctor_lang_key)
-                translated = ai.translate(english_pivot, "en_to_native", lang_key)
+                # Native → native in one NLLB pass (faster and more accurate than English pivot)
+                translated = ai.translate_native_pair(original, doctor_lang_key, lang_key)
+                translation_engine = describe_translation_engine(lang_key)
         else:
             # Patient speaking in their language
-            stt_engine = "whisper"
+            stt_engine = f"faster-whisper-{os.environ.get('FASTER_WHISPER_MODEL', 'medium')}+"
             stt_retried = False
             if lang_key == "English":
-                original = ai.whisper_stt(temp_path, "en")
+                original = ai.whisper_stt(stt_path, "en", patient_id, role)
             else:
-                # Try Sarvam AI first (best for Indian languages), fall back to Whisper
+                # Faster-Whisper is the primary offline STT path; Sarvam is only a fallback.
+                whisper_lang = whisper_lang_codes.get(lang_key, "hi")
                 try:
-                    original = ai.sarvam_stt(temp_path, sarvam_lang_codes.get(lang_key, "hi-IN"))
-                    stt_engine = "sarvam"
-                except Exception as sarvam_err:
-                    print(f"[Sarvam STT failed, falling back to Whisper]: {sarvam_err}")
-                    whisper_lang = whisper_lang_codes.get(lang_key, "hi")
-                    original = ai.whisper_stt(temp_path, whisper_lang)
-                    stt_engine = "whisper_fallback"
+                    original = ai.whisper_stt(stt_path, whisper_lang, patient_id, role)
+                except Exception as whisper_err:
+                    print(f"[Faster-Whisper STT failed, trying Sarvam fallback]: {whisper_err}")
+                    original = ai.sarvam_stt(stt_path, sarvam_lang_codes.get(lang_key, "hi-IN"))
+                    stt_engine = "sarvam_fallback"
 
                 # If script looks mismatched (e.g., Malayalam text for Hindi), retry with forced Whisper lang.
                 if not ai.is_language_consistent(original, lang_key):
                     forced_lang = whisper_lang_codes.get(lang_key, "hi")
-                    print(f"[STT language mismatch] patient transcript didn't match {lang_key}; retrying Whisper ({forced_lang})")
-                    original = ai.whisper_stt(temp_path, forced_lang)
+                    print(f"[STT language mismatch] patient transcript didn't match {lang_key}; retrying Faster-Whisper ({forced_lang})")
+                    original = ai.whisper_stt(stt_path, forced_lang, patient_id, role)
                     stt_retried = True
-                    stt_engine = "whisper_forced_retry"
+                    stt_engine = "faster-whisper_forced_retry"
 
             script_ok = ai.is_language_consistent(original, lang_key)
             stt_confidence, low_confidence = _score_stt_quality(
                 original, lang_key, script_ok, stt_retried, stt_engine
             )
-            original = ai.correct_transcript(original)
+            original = ai.correct_transcript(original, patient_id, role)
 
             # Translate: patient_lang → doctor_lang
             if lang_key == doctor_lang_key:
                 translated = original
+                translation_engine = "No machine translation needed"
             elif lang_key == "English" and doctor_lang_key != "English":
                 translated = ai.translate(original, "en_to_native", doctor_lang_key)
+                translation_engine = describe_translation_engine(doctor_lang_key)
             elif lang_key != "English" and doctor_lang_key == "English":
                 translated = ai.translate(original, "native_to_en", lang_key)
+                translation_engine = describe_translation_engine(lang_key)
             else:
-                # Native language A → English → Native language B (pivot translation)
-                english_pivot = ai.translate(original, "native_to_en", lang_key)
-                translated = ai.translate(english_pivot, "en_to_native", doctor_lang_key)
+                translated = ai.translate_native_pair(original, lang_key, doctor_lang_key)
+                translation_engine = describe_translation_engine(doctor_lang_key)
         
         # ── Medical transcript correction (LLM post-processing) ────────────
         # ───────────────────────────────────────────────────────────────────
@@ -325,6 +394,7 @@ async def speech_to_text(
                 "stt_confidence": stt_confidence,
                 "low_confidence": True,
                 "stt_engine": stt_engine,
+                "audio_enhancement": audio_enhancement,
             }
 
         # Persist this utterance so it can be replayed per-message in the UI
@@ -332,7 +402,7 @@ async def speech_to_text(
         audio_filename = f"utt_{utt_ts}_{role}.wav"
         final_path = os.path.join(recordings_dir, audio_filename)
         try:
-            shutil.move(temp_path, final_path)
+            shutil.move(stt_path, final_path)
         except Exception:
             # If move fails for any reason, fall back to leaving it as temp
             audio_filename = None
@@ -354,6 +424,7 @@ async def speech_to_text(
             "original":   original,
             "translated": translated,
             "role":       role,
+            "translation_engine": translation_engine,
             "audio_filename": audio_filename,
             "audio_url": (f"/patients/{patient_id}/recordings/{audio_filename}" if audio_filename else None),
             "translated_audio_filename": translated_audio_filename,
@@ -364,8 +435,19 @@ async def speech_to_text(
             "stt_confidence": stt_confidence,
             "low_confidence": low_confidence,
             "stt_engine": stt_engine,
+            "audio_enhancement": audio_enhancement,
         }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[STT endpoint failed] {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail=f"Audio processing failed: {e}")
     finally:
+        if processed_audio and os.path.exists(processed_audio.path):
+            try:
+                os.remove(processed_audio.path)
+            except Exception:
+                pass
         if os.path.exists(temp_path):
             try:
                 os.remove(temp_path)
@@ -377,6 +459,39 @@ async def correct_transcript_endpoint(req: CorrectionRequest):
     """Standalone endpoint: run any text through the medical correction LLM."""
     corrected = ai.correct_transcript(req.text)
     return {"original": req.text, "corrected": corrected}
+
+@app.post("/text_chat")
+async def text_chat(req: TextChatRequest):
+    text = (req.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Text is required")
+
+    if req.role == "doctor":
+        source_lang = req.doctor_lang_key
+        target_lang = req.lang_key
+    else:
+        source_lang = req.lang_key
+        target_lang = req.doctor_lang_key
+
+    if source_lang == target_lang:
+        translated = text
+        translation_engine = "No machine translation needed"
+    elif source_lang == "English":
+        translated = ai.translate(text, "en_to_native", target_lang)
+        translation_engine = describe_translation_engine(target_lang)
+    elif target_lang == "English":
+        translated = ai.translate(text, "native_to_en", source_lang)
+        translation_engine = describe_translation_engine(source_lang)
+    else:
+        translated = ai.translate_native_pair(text, source_lang, target_lang)
+        translation_engine = describe_translation_engine(target_lang)
+
+    return {
+        "role": req.role,
+        "original": text,
+        "translated": translated,
+        "translation_engine": translation_engine,
+    }
 
 @app.post("/patients/{patient_id}/append_transcript")
 async def append_transcript(patient_id: str, entry: TranscriptEntry):

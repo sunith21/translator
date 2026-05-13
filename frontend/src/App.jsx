@@ -5,6 +5,14 @@ import './App.css';
 
 const API_BASE = 'http://localhost:8000';
 
+function formatApiError(err) {
+  if (err.response?.data?.detail) return err.response.data.detail;
+  if (!err.response && err.message === 'Network Error') {
+    return 'Backend did not respond. Restart the backend and check its terminal for the audio/model error.';
+  }
+  return err.message || 'Request failed';
+}
+
 // Convert any browser audio blob (webm/ogg/opus) → 16-bit PCM WAV at 16 kHz mono
 // This avoids the ffmpeg dependency on the backend entirely.
 async function blobToWav(blob) {
@@ -278,7 +286,7 @@ function Consultation({ patient, onEnd }) {
   const [currentRole, setCurrentRole]     = useState(null);
   const [langKey, setLangKey]             = useState('Hindi (हिन्दी)');
   const [doctorLang, setDoctorLang]       = useState('English');
-  const [status, setStatus]               = useState('Ready');
+  const [status, setStatus]               = useState('Ready - NLLB-200 offline mode');
   const [patientText, setPatientText]     = useState('');
   const [isTranslatingText, setIsTranslatingText] = useState(false);
   const [showArchives, setShowArchives]   = useState(false);
@@ -374,7 +382,7 @@ function Consultation({ patient, onEnd }) {
     const { samples, role, lk, dlk } = vadQueue.current.shift();
     setQueueLen(vadQueue.current.length);
     setVadState('processing');
-    setStatus(role === 'auto' ? 'Auto-detecting speaker…' : `Processing ${role} speech…`);
+    setStatus(role === 'auto' ? 'Auto-detecting speaker...' : `Processing ${role} speech with NMT...`);
     try {
       const wav = encodeWAVFromFloat32(samples);
       const fd  = new FormData();
@@ -393,11 +401,13 @@ function Consultation({ patient, onEnd }) {
         role: resolvedRole,
         original: res.data.original,
         translated: res.data.translated,
+        translation_engine: res.data.translation_engine || null,
         audio_filename: res.data.audio_filename || null,
         translated_audio_filename: res.data.translated_audio_filename || null,
         stt_confidence: res.data.stt_confidence ?? null,
         low_confidence: !!res.data.low_confidence,
         stt_engine: res.data.stt_engine || null,
+        audio_enhancement: res.data.audio_enhancement || null,
       };
       entry.translated_audio_filename = await ensureTranslatedClip(entry);
       await axios.post(`${API_BASE}/patients/${pid}/append_transcript`, entry);
@@ -405,7 +415,7 @@ function Consultation({ patient, onEnd }) {
       playTranslatedAudio(entry.translated_audio_filename);
       setStatus(`Done ✓ — ${resolvedRole.charAt(0).toUpperCase() + resolvedRole.slice(1)} detected`);
     } catch (err) {
-      setStatus(`Error: ${err.response?.data?.detail || err.message}`);
+      setStatus(`Error: ${formatApiError(err)}`);
     } finally {
       vadProcessing.current = false;
       if (vadQueue.current.length > 0) drainQueue(pid);
@@ -519,7 +529,7 @@ function Consultation({ patient, onEnd }) {
           fd.append('lang_key', langKeyRef.current);
           fd.append('doctor_lang_key', doctorLangRef.current);
           fd.append('patient_id', patient.id);
-          setStatus('Transcribing & translating…');
+          setStatus('Transcribing and translating with NMT...');
           const res   = await axios.post(`${API_BASE}/stt`, fd);
           if (res.data?.ignored) {
             setStatus(`Skipped: ${res.data.reason || 'Unsupported language detected.'}`);
@@ -529,11 +539,13 @@ function Consultation({ patient, onEnd }) {
             role,
             original: res.data.original,
             translated: res.data.translated,
+            translation_engine: res.data.translation_engine || null,
             audio_filename: res.data.audio_filename || null,
             translated_audio_filename: res.data.translated_audio_filename || null,
             stt_confidence: res.data.stt_confidence ?? null,
             low_confidence: !!res.data.low_confidence,
             stt_engine: res.data.stt_engine || null,
+            audio_enhancement: res.data.audio_enhancement || null,
           };
           entry.translated_audio_filename = await ensureTranslatedClip(entry);
           await axios.post(`${API_BASE}/patients/${patient.id}/append_transcript`, entry);
@@ -541,7 +553,7 @@ function Consultation({ patient, onEnd }) {
           playTranslatedAudio(entry.translated_audio_filename);
           setStatus('Done ✓');
         } catch (err) {
-          setStatus(`Error: ${err.response?.data?.detail || err.message}`);
+          setStatus(`Error: ${formatApiError(err)}`);
         } finally { setIsProcessing(false); setCurrentRole(null); }
       };
       mediaRecorder.current.start();
@@ -556,7 +568,7 @@ function Consultation({ patient, onEnd }) {
 
   const submitPatientText = async () => {
     if (!patientText.trim()) return;
-    setIsTranslatingText(true); setStatus('Translating patient text…');
+    setIsTranslatingText(true); setStatus('Translating patient text with NMT...');
     try {
       const res = await axios.post(`${API_BASE}/text_chat`, {
         patient_id: patient.id,
@@ -565,7 +577,12 @@ function Consultation({ patient, onEnd }) {
         lang_key: langKey,
         doctor_lang_key: doctorLang,
       });
-      const entry = { role: 'patient', original: patientText, translated: res.data.translated };
+      const entry = {
+        role: 'patient',
+        original: patientText,
+        translated: res.data.translated,
+        translation_engine: res.data.translation_engine || null,
+      };
       await axios.post(`${API_BASE}/patients/${patient.id}/append_transcript`, entry);
       setMessages(prev => [...prev, { ...entry, timestamp: new Date().toLocaleTimeString() }]);
       setPatientText(''); setStatus('Done ✓');
@@ -810,6 +827,9 @@ function Consultation({ patient, onEnd }) {
                 )}
                 <p className="msg-original"><span className="msg-label">Original:</span> {m.original}</p>
                 <p className="msg-translated"><span className="msg-label">Translated:</span> {m.translated}</p>
+                {m.translation_engine && (
+                  <p className="nmt-badge">{m.translation_engine}</p>
+                )}
                 {m.audio_filename && (
                   <>
                     <p className="msg-label" style={{ marginTop: '8px' }}>Original utterance clip</p>
